@@ -21,7 +21,7 @@ use parking_lot::Mutex;
 use time::UtcOffset;
 use util::{ResultExt, SemanticVersion};
 use windows::{
-    core::{IUnknown, HRESULT, HSTRING, PCWSTR, PWSTR},
+    core::{IUnknown, HRESULT, HSTRING, PCWSTR, PWSTR, h},
     Wdk::System::SystemServices::RtlGetVersion,
     Win32::{
         Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, TRUE},
@@ -371,7 +371,7 @@ impl Platform for WindowsPlatform {
                 unsafe {
                     folder_dialog.SetOptions(dialog_options).unwrap();
                     folder_dialog
-                        .SetTitle(&HSTRING::from(OsString::from("Select a folder")))
+                        .SetTitle(h!("Select a folder"))
                         .unwrap();
                 }
 
