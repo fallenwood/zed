@@ -1,13 +1,13 @@
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
-    overlay, point, prelude::FluentBuilder, px, rems, AnchorCorner, AnyElement, Bounds,
-    DismissEvent, DispatchPhase, Element, ElementContext, ElementId, HitboxId, IntoElement,
-    LayoutId, ManagedView, MouseDownEvent, ParentElement, Pixels, Point, View, VisualContext,
-    WindowContext,
+    div, overlay, point, prelude::FluentBuilder, px, AnchorCorner, AnyElement, Bounds,
+    DismissEvent, DispatchPhase, Element, ElementContext, ElementId, HitboxId, InteractiveElement,
+    IntoElement, LayoutId, ManagedView, MouseDownEvent, ParentElement, Pixels, Point, View,
+    VisualContext, WindowContext,
 };
 
-use crate::{Clickable, Selectable};
+use crate::prelude::*;
 
 pub trait PopoverTrigger: IntoElement + Clickable + Selectable + 'static {}
 
@@ -102,7 +102,7 @@ impl<M: ManagedView> PopoverMenu<M> {
     fn resolved_offset(&self, cx: &WindowContext) -> Point<Pixels> {
         self.offset.unwrap_or_else(|| {
             // Default offset = 4px padding + 1px border
-            let offset = rems(5. / 16.) * cx.rem_size();
+            let offset = rems_from_px(5.) * cx.rem_size();
             match self.anchor {
                 AnchorCorner::TopRight | AnchorCorner::BottomRight => point(offset, px(0.)),
                 AnchorCorner::TopLeft | AnchorCorner::BottomLeft => point(-offset, px(0.)),
@@ -184,7 +184,9 @@ impl<M: ManagedView> Element for PopoverMenu<M> {
                     );
                 }
 
-                let mut element = overlay.child(menu.clone()).into_any();
+                let mut element = overlay
+                    .child(div().occlude().child(menu.clone()))
+                    .into_any();
                 menu_layout_id = Some(element.before_layout(cx));
                 element
             });

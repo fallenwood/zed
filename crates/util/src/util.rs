@@ -7,11 +7,10 @@ mod semantic_version;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 
-pub use backtrace::Backtrace;
 use futures::Future;
 use lazy_static::lazy_static;
 use rand::{seq::SliceRandom, Rng};
-pub use semantic_version::SemanticVersion;
+pub use semantic_version::*;
 use std::{
     borrow::Cow,
     cmp::{self, Ordering},
@@ -32,7 +31,7 @@ macro_rules! debug_panic {
         if cfg!(debug_assertions) {
             panic!( $($fmt_arg)* );
         } else {
-            let backtrace = $crate::Backtrace::new();
+            let backtrace = std::backtrace::Backtrace::capture();
             log::error!("{}\n{:?}", format_args!($($fmt_arg)*), backtrace);
         }
     };

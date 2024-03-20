@@ -35,8 +35,8 @@ use crate::{
     GlyphId, Hsla, ImageData, InputHandler, IsZero, KeyContext, KeyEvent, LayoutId,
     LineLayoutIndex, MonochromeSprite, MouseEvent, PaintQuad, Path, Pixels, PlatformInputHandler,
     Point, PolychromeSprite, Quad, RenderGlyphParams, RenderImageParams, RenderSvgParams, Scene,
-    Shadow, SharedString, Size, StrikethroughStyle, Style, TextStyleRefinement, Underline,
-    UnderlineStyle, Window, WindowContext, SUBPIXEL_VARIANTS,
+    Shadow, SharedString, Size, StrikethroughStyle, Style, TextStyleRefinement,
+    TransformationMatrix, Underline, UnderlineStyle, Window, WindowContext, SUBPIXEL_VARIANTS,
 };
 
 pub(crate) type AnyMouseListener =
@@ -61,7 +61,7 @@ impl HitboxId {
 
 /// A rectangular region that potentially blocks hitboxes inserted prior.
 /// See [ElementContext::insert_hitbox] for more details.
-#[derive(Clone, Debug, Eq, PartialEq, Deref)]
+#[derive(Clone, Debug, Deref)]
 pub struct Hitbox {
     /// A unique identifier for the hitbox
     pub id: HitboxId,
@@ -79,7 +79,7 @@ impl Hitbox {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Eq, PartialEq)]
 pub(crate) struct HitTest(SmallVec<[HitboxId; 8]>);
 
 pub(crate) struct DeferredDraw {
@@ -381,8 +381,7 @@ impl<'a> ElementContext<'a> {
 
         let mut sorted_deferred_draws =
             (0..self.window.next_frame.deferred_draws.len()).collect::<SmallVec<[_; 8]>>();
-        sorted_deferred_draws
-            .sort_unstable_by_key(|ix| self.window.next_frame.deferred_draws[*ix].priority);
+        sorted_deferred_draws.sort_by_key(|ix| self.window.next_frame.deferred_draws[*ix].priority);
         self.layout_deferred_draws(&sorted_deferred_draws);
 
         self.window.mouse_hit_test = self.window.next_frame.hit_test(self.window.mouse_position);
@@ -433,6 +432,7 @@ impl<'a> ElementContext<'a> {
         );
         self.window.next_frame.deferred_draws = deferred_draws;
         self.window.element_id_stack.clear();
+        self.window.text_style_stack.clear();
     }
 
     fn paint_deferred_draws(&mut self, deferred_draw_indices: &[usize]) {
@@ -1007,6 +1007,7 @@ impl<'a> ElementContext<'a> {
                     content_mask,
                     color,
                     tile,
+                    transformation: TransformationMatrix::unit(),
                 });
         }
         Ok(())
@@ -1072,6 +1073,7 @@ impl<'a> ElementContext<'a> {
         &mut self,
         bounds: Bounds<Pixels>,
         path: SharedString,
+        transformation: TransformationMatrix,
         color: Hsla,
     ) -> Result<()> {
         let scale_factor = self.scale_factor();
@@ -1103,6 +1105,7 @@ impl<'a> ElementContext<'a> {
                 content_mask,
                 color,
                 tile,
+                transformation,
             });
 
         Ok(())
@@ -1264,6 +1267,11 @@ impl<'a> ElementContext<'a> {
     /// Sets the view id for the current element, which will be used to manage view caching.
     pub fn set_view_id(&mut self, view_id: EntityId) {
         self.window.next_frame.dispatch_tree.set_view_id(view_id);
+    }
+
+    /// Get the last view id for the current element
+    pub fn parent_view_id(&mut self) -> Option<EntityId> {
+        self.window.next_frame.dispatch_tree.parent_view_id()
     }
 
     /// Sets an input handler, such as [`ElementInputHandler`][element_input_handler], which interfaces with the

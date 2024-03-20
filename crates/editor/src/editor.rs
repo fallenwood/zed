@@ -101,6 +101,7 @@ use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
 use smallvec::SmallVec;
 use snippet::Snippet;
+use std::ops::Not as _;
 use std::{
     any::TypeId,
     borrow::Cow,
@@ -124,7 +125,9 @@ use ui::{
 };
 use util::{maybe, post_inc, RangeExt, ResultExt, TryFutureExt};
 use workspace::Toast;
-use workspace::{searchable::SearchEvent, ItemNavHistory, SplitDirection, ViewId, Workspace};
+use workspace::{
+    searchable::SearchEvent, ItemNavHistory, SplitDirection, ViewId, Workspace, WorkspaceId,
+};
 
 use crate::hover_links::find_url;
 
@@ -362,7 +365,7 @@ pub struct Editor {
     buffer: Model<MultiBuffer>,
     /// Map of how text in the buffer should be displayed.
     /// Handles soft wraps, folds, fake inlay text insertions, etc.
-    display_map: Model<DisplayMap>,
+    pub display_map: Model<DisplayMap>,
     pub selections: SelectionsCollection,
     pub scroll_manager: ScrollManager,
     columnar_selection_tail: Option<Anchor>,
@@ -395,6 +398,7 @@ pub struct Editor {
     context_menu: RwLock<Option<ContextMenu>>,
     mouse_context_menu: Option<MouseContextMenu>,
     completion_tasks: Vec<(CompletionId, Task<Option<()>>)>,
+    find_all_references_task_sources: Vec<Anchor>,
     next_completion_id: CompletionId,
     completion_documentation_pre_resolve_debounce: DebouncedDelay,
     available_code_actions: Option<(Model<Buffer>, Arc<[CodeAction]>)>,
@@ -405,7 +409,7 @@ pub struct Editor {
     cursor_shape: CursorShape,
     collapse_matches: bool,
     autoindent_mode: Option<AutoindentMode>,
-    workspace: Option<(WeakView<Workspace>, i64)>,
+    workspace: Option<(WeakView<Workspace>, WorkspaceId)>,
     keymap_context_layers: BTreeMap<TypeId, KeyContext>,
     input_enabled: bool,
     use_modal_editing: bool,
@@ -421,6 +425,7 @@ pub struct Editor {
     _subscriptions: Vec<Subscription>,
     pixel_position_of_newest_cursor: Option<gpui::Point<Pixels>>,
     gutter_width: Pixels,
+    pub vim_replace_map: HashMap<Range<usize>, String>,
     style: Option<EditorStyle>,
     editor_actions: Vec<Box<dyn Fn(&mut ViewContext<Self>)>>,
     show_copilot_suggestions: bool,
@@ -1534,6 +1539,7 @@ impl Editor {
             context_menu: RwLock::new(None),
             mouse_context_menu: None,
             completion_tasks: Default::default(),
+            find_all_references_task_sources: Vec::new(),
             next_completion_id: 0,
             completion_documentation_pre_resolve_debounce: DebouncedDelay::new(),
             next_inlay_id: 0,
@@ -1565,6 +1571,7 @@ impl Editor {
             show_cursor_names: false,
             hovered_cursors: Default::default(),
             editor_actions: Default::default(),
+            vim_replace_map: Default::default(),
             show_copilot_suggestions: mode == EditorMode::Full,
             custom_context_menu: None,
             _subscriptions: vec![
@@ -2425,16 +2432,23 @@ impl Editor {
                 // bracket of any of this language's bracket pairs.
                 let mut bracket_pair = None;
                 let mut is_bracket_pair_start = false;
+                let mut is_bracket_pair_end = false;
                 if !text.is_empty() {
                     // `text` can be empty when a user is using IME (e.g. Chinese Wubi Simplified)
                     //  and they are removing the character that triggered IME popup.
                     for (pair, enabled) in scope.brackets() {
-                        if enabled && pair.close && pair.start.ends_with(text.as_ref()) {
+                        if !pair.close {
+                            continue;
+                        }
+
+                        if enabled && pair.start.ends_with(text.as_ref()) {
                             bracket_pair = Some(pair.clone());
                             is_bracket_pair_start = true;
                             break;
-                        } else if pair.end.as_str() == text.as_ref() {
+                        }
+                        if pair.end.as_str() == text.as_ref() {
                             bracket_pair = Some(pair.clone());
+                            is_bracket_pair_end = true;
                             break;
                         }
                     }
@@ -2496,6 +2510,21 @@ impl Editor {
                                     .push((selection.map(|_| anchor), region.pair.end.len()));
                                 continue;
                             }
+                        }
+
+                        let always_treat_brackets_as_autoclosed = snapshot
+                            .settings_at(selection.start, cx)
+                            .always_treat_brackets_as_autoclosed;
+                        if always_treat_brackets_as_autoclosed
+                            && is_bracket_pair_end
+                            && snapshot.contains_str_at(selection.end, text.as_ref())
+                        {
+                            // Otherwise, when `always_treat_brackets_as_autoclosed` is set to `true
+                            // and the inserted text is a closing bracket and the selection is followed
+                            // by the closing bracket then move the selection past the closing bracket.
+                            let anchor = snapshot.anchor_after(selection.end);
+                            new_selections.push((selection.map(|_| anchor), text.len()));
+                            continue;
                         }
                     }
                     // If an opening bracket is 1 character long and is typed while
@@ -2949,13 +2978,10 @@ impl Editor {
     }
 
     pub fn insert(&mut self, text: &str, cx: &mut ViewContext<Self>) {
-        self.insert_with_autoindent_mode(
-            text,
-            Some(AutoindentMode::Block {
-                original_indent_columns: Vec::new(),
-            }),
-            cx,
-        );
+        let autoindent = text.is_empty().not().then(|| AutoindentMode::Block {
+            original_indent_columns: Vec::new(),
+        });
+        self.insert_with_autoindent_mode(text, autoindent, cx);
     }
 
     fn insert_with_autoindent_mode(
@@ -3020,25 +3046,59 @@ impl Editor {
     fn select_autoclose_pair(&mut self, cx: &mut ViewContext<Self>) {
         let selections = self.selections.all::<usize>(cx);
         let buffer = self.buffer.read(cx).read(cx);
-        let mut new_selections = Vec::new();
-        for (mut selection, region) in self.selections_with_autoclose_regions(selections, &buffer) {
-            if let (Some(region), true) = (region, selection.is_empty()) {
-                let mut range = region.range.to_offset(&buffer);
-                if selection.start == range.start {
-                    if range.start >= region.pair.start.len() {
+        let new_selections = self
+            .selections_with_autoclose_regions(selections, &buffer)
+            .map(|(mut selection, region)| {
+                if !selection.is_empty() {
+                    return selection;
+                }
+
+                if let Some(region) = region {
+                    let mut range = region.range.to_offset(&buffer);
+                    if selection.start == range.start && range.start >= region.pair.start.len() {
                         range.start -= region.pair.start.len();
-                        if buffer.contains_str_at(range.start, &region.pair.start) {
-                            if buffer.contains_str_at(range.end, &region.pair.end) {
-                                range.end += region.pair.end.len();
-                                selection.start = range.start;
-                                selection.end = range.end;
+                        if buffer.contains_str_at(range.start, &region.pair.start)
+                            && buffer.contains_str_at(range.end, &region.pair.end)
+                        {
+                            range.end += region.pair.end.len();
+                            selection.start = range.start;
+                            selection.end = range.end;
+
+                            return selection;
+                        }
+                    }
+                }
+
+                let always_treat_brackets_as_autoclosed = buffer
+                    .settings_at(selection.start, cx)
+                    .always_treat_brackets_as_autoclosed;
+
+                if !always_treat_brackets_as_autoclosed {
+                    return selection;
+                }
+
+                if let Some(scope) = buffer.language_scope_at(selection.start) {
+                    for (pair, enabled) in scope.brackets() {
+                        if !enabled || !pair.close {
+                            continue;
+                        }
+
+                        if buffer.contains_str_at(selection.start, &pair.end) {
+                            let pair_start_len = pair.start.len();
+                            if buffer.contains_str_at(selection.start - pair_start_len, &pair.start)
+                            {
+                                selection.start -= pair_start_len;
+                                selection.end += pair.end.len();
+
+                                return selection;
                             }
                         }
                     }
                 }
-            }
-            new_selections.push(selection);
-        }
+
+                selection
+            })
+            .collect();
 
         drop(buffer);
         self.change_selections(None, cx, |selections| selections.select(new_selections));
@@ -5695,6 +5755,9 @@ impl Editor {
             self.unmark_text(cx);
             self.refresh_copilot_suggestions(true, cx);
             cx.emit(EditorEvent::Edited);
+            cx.emit(EditorEvent::TransactionUndone {
+                transaction_id: tx_id,
+            });
         }
     }
 
@@ -5720,6 +5783,11 @@ impl Editor {
     pub fn finalize_last_transaction(&mut self, cx: &mut ViewContext<Self>) {
         self.buffer
             .update(cx, |buffer, cx| buffer.finalize_last_transaction(cx));
+    }
+
+    pub fn group_until_transaction(&mut self, tx_id: TransactionId, cx: &mut ViewContext<Self>) {
+        self.buffer
+            .update(cx, |buffer, cx| buffer.group_until_transaction(tx_id, cx));
     }
 
     pub fn move_left(&mut self, _: &MoveLeft, cx: &mut ViewContext<Self>) {
@@ -7608,36 +7676,52 @@ impl Editor {
         }
     }
 
-    pub fn go_to_definition(&mut self, _: &GoToDefinition, cx: &mut ViewContext<Self>) {
-        self.go_to_definition_of_kind(GotoDefinitionKind::Symbol, false, cx);
+    pub fn go_to_definition(
+        &mut self,
+        _: &GoToDefinition,
+        cx: &mut ViewContext<Self>,
+    ) -> Task<Result<bool>> {
+        self.go_to_definition_of_kind(GotoDefinitionKind::Symbol, false, cx)
     }
 
-    pub fn go_to_implementation(&mut self, _: &GoToImplementation, cx: &mut ViewContext<Self>) {
-        self.go_to_definition_of_kind(GotoDefinitionKind::Implementation, false, cx);
+    pub fn go_to_implementation(
+        &mut self,
+        _: &GoToImplementation,
+        cx: &mut ViewContext<Self>,
+    ) -> Task<Result<bool>> {
+        self.go_to_definition_of_kind(GotoDefinitionKind::Implementation, false, cx)
     }
 
     pub fn go_to_implementation_split(
         &mut self,
         _: &GoToImplementationSplit,
         cx: &mut ViewContext<Self>,
-    ) {
-        self.go_to_definition_of_kind(GotoDefinitionKind::Implementation, true, cx);
+    ) -> Task<Result<bool>> {
+        self.go_to_definition_of_kind(GotoDefinitionKind::Implementation, true, cx)
     }
 
-    pub fn go_to_type_definition(&mut self, _: &GoToTypeDefinition, cx: &mut ViewContext<Self>) {
-        self.go_to_definition_of_kind(GotoDefinitionKind::Type, false, cx);
+    pub fn go_to_type_definition(
+        &mut self,
+        _: &GoToTypeDefinition,
+        cx: &mut ViewContext<Self>,
+    ) -> Task<Result<bool>> {
+        self.go_to_definition_of_kind(GotoDefinitionKind::Type, false, cx)
     }
 
-    pub fn go_to_definition_split(&mut self, _: &GoToDefinitionSplit, cx: &mut ViewContext<Self>) {
-        self.go_to_definition_of_kind(GotoDefinitionKind::Symbol, true, cx);
+    pub fn go_to_definition_split(
+        &mut self,
+        _: &GoToDefinitionSplit,
+        cx: &mut ViewContext<Self>,
+    ) -> Task<Result<bool>> {
+        self.go_to_definition_of_kind(GotoDefinitionKind::Symbol, true, cx)
     }
 
     pub fn go_to_type_definition_split(
         &mut self,
         _: &GoToTypeDefinitionSplit,
         cx: &mut ViewContext<Self>,
-    ) {
-        self.go_to_definition_of_kind(GotoDefinitionKind::Type, true, cx);
+    ) -> Task<Result<bool>> {
+        self.go_to_definition_of_kind(GotoDefinitionKind::Type, true, cx)
     }
 
     fn go_to_definition_of_kind(
@@ -7645,16 +7729,16 @@ impl Editor {
         kind: GotoDefinitionKind,
         split: bool,
         cx: &mut ViewContext<Self>,
-    ) {
+    ) -> Task<Result<bool>> {
         let Some(workspace) = self.workspace() else {
-            return;
+            return Task::ready(Ok(false));
         };
         let buffer = self.buffer.read(cx);
         let head = self.selections.newest::<usize>(cx).head();
         let (buffer, head) = if let Some(text_anchor) = buffer.text_anchor_for_position(head, cx) {
             text_anchor
         } else {
-            return;
+            return Task::ready(Ok(false));
         };
 
         let project = workspace.read(cx).project().clone();
@@ -7666,17 +7750,18 @@ impl Editor {
 
         cx.spawn(|editor, mut cx| async move {
             let definitions = definitions.await?;
-            editor.update(&mut cx, |editor, cx| {
-                editor.navigate_to_hover_links(
-                    Some(kind),
-                    definitions.into_iter().map(HoverLink::Text).collect(),
-                    split,
-                    cx,
-                );
-            })?;
-            Ok::<(), anyhow::Error>(())
+            let navigated = editor
+                .update(&mut cx, |editor, cx| {
+                    editor.navigate_to_hover_links(
+                        Some(kind),
+                        definitions.into_iter().map(HoverLink::Text).collect(),
+                        split,
+                        cx,
+                    )
+                })?
+                .await?;
+            anyhow::Ok(navigated)
         })
-        .detach_and_log_err(cx);
     }
 
     pub fn open_url(&mut self, _: &OpenUrl, cx: &mut ViewContext<Self>) {
@@ -7705,7 +7790,7 @@ impl Editor {
         mut definitions: Vec<HoverLink>,
         split: bool,
         cx: &mut ViewContext<Editor>,
-    ) {
+    ) -> Task<Result<bool>> {
         // If there is one definition, just open it directly
         if definitions.len() == 1 {
             let definition = definitions.pop().unwrap();
@@ -7724,7 +7809,7 @@ impl Editor {
                 if let Some(target) = target {
                     editor.update(&mut cx, |editor, cx| {
                         let Some(workspace) = editor.workspace() else {
-                            return;
+                            return false;
                         };
                         let pane = workspace.read(cx).active_pane().clone();
 
@@ -7761,12 +7846,12 @@ impl Editor {
                                 });
                             });
                         }
+                        true
                     })
                 } else {
-                    Ok(())
+                    Ok(false)
                 }
             })
-            .detach_and_log_err(cx);
         } else if !definitions.is_empty() {
             let replica_id = self.replica_id(cx);
             cx.spawn(|editor, mut cx| async move {
@@ -7815,9 +7900,9 @@ impl Editor {
                     .context("location tasks")?;
 
                 let Some(workspace) = workspace else {
-                    return Ok(());
+                    return Ok(false);
                 };
-                workspace
+                let opened = workspace
                     .update(&mut cx, |workspace, cx| {
                         Self::open_locations_in_multibuffer(
                             workspace, locations, replica_id, title, split, cx,
@@ -7825,9 +7910,10 @@ impl Editor {
                     })
                     .ok();
 
-                anyhow::Ok(())
+                anyhow::Ok(opened.is_some())
             })
-            .detach_and_log_err(cx);
+        } else {
+            Task::ready(Ok(false))
         }
     }
 
@@ -7887,15 +7973,40 @@ impl Editor {
         _: &FindAllReferences,
         cx: &mut ViewContext<Self>,
     ) -> Option<Task<Result<()>>> {
-        let buffer = self.buffer.read(cx);
-        let head = self.selections.newest::<usize>(cx).head();
-        let (buffer, head) = buffer.text_anchor_for_position(head, cx)?;
-        let replica_id = self.replica_id(cx);
+        let multi_buffer = self.buffer.read(cx);
+        let selection = self.selections.newest::<usize>(cx);
+        let head = selection.head();
 
+        let multi_buffer_snapshot = multi_buffer.snapshot(cx);
+        let head_anchor = multi_buffer_snapshot.anchor_at(
+            head,
+            if head < selection.tail() {
+                Bias::Right
+            } else {
+                Bias::Left
+            },
+        );
+        match self
+            .find_all_references_task_sources
+            .binary_search_by(|task_anchor| task_anchor.cmp(&head_anchor, &multi_buffer_snapshot))
+        {
+            Ok(_) => {
+                log::info!(
+                    "Ignoring repeated FindAllReferences invocation with the position of already running task"
+                );
+                return None;
+            }
+            Err(i) => {
+                self.find_all_references_task_sources.insert(i, head_anchor);
+            }
+        }
+
+        let (buffer, head) = multi_buffer.text_anchor_for_position(head, cx)?;
+        let replica_id = self.replica_id(cx);
         let workspace = self.workspace()?;
         let project = workspace.read(cx).project().clone();
         let references = project.update(cx, |project, cx| project.references(&buffer, head, cx));
-        Some(cx.spawn(|editor, mut cx| async move {
+        let open_task = cx.spawn(|editor, mut cx| async move {
             let mut locations = references.await?;
             let snapshot = buffer.update(&mut cx, |buffer, _| buffer.snapshot())?;
             let head_offset = text::ToOffset::to_offset(&head, &snapshot);
@@ -7977,6 +8088,21 @@ impl Editor {
             })?;
 
             Ok(())
+        });
+        Some(cx.spawn(|editor, mut cx| async move {
+            open_task.await?;
+            editor.update(&mut cx, |editor, _| {
+                if let Ok(i) =
+                    editor
+                        .find_all_references_task_sources
+                        .binary_search_by(|task_anchor| {
+                            task_anchor.cmp(&head_anchor, &multi_buffer_snapshot)
+                        })
+                {
+                    editor.find_all_references_task_sources.remove(i);
+                }
+            })?;
+            anyhow::Ok(())
         }))
     }
 
@@ -8491,6 +8617,9 @@ impl Editor {
         {
             self.selection_history
                 .insert_transaction(tx_id, self.selections.disjoint_anchors());
+            cx.emit(EditorEvent::TransactionBegun {
+                transaction_id: tx_id,
+            })
         }
     }
 
@@ -9242,8 +9371,7 @@ impl Editor {
             .redacted_ranges(search_range, |file| {
                 if let Some(file) = file {
                     file.is_private()
-                        && EditorSettings::get(Some((file.worktree_id(), file.path())), cx)
-                            .redact_private_values
+                        && EditorSettings::get(Some(file.as_ref().into()), cx).redact_private_values
                 } else {
                     false
                 }
@@ -9463,9 +9591,8 @@ impl Editor {
                 } else {
                     workspace.active_pane().clone()
                 };
-                pane.update(cx, |pane, _| pane.disable_history());
 
-                for (buffer, ranges) in new_selections_by_buffer.into_iter() {
+                for (buffer, ranges) in new_selections_by_buffer {
                     let editor = workspace.open_project_item::<Self>(pane.clone(), buffer, cx);
                     editor.update(cx, |editor, cx| {
                         editor.change_selections(Some(Autoscroll::newest()), cx, |s| {
@@ -9473,8 +9600,6 @@ impl Editor {
                         });
                     });
                 }
-
-                pane.update(cx, |pane, _| pane.enable_history());
             })
         });
     }
@@ -9585,22 +9710,16 @@ impl Editor {
         telemetry.report_copilot_event(suggestion_id, suggestion_accepted, file_extension)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    fn report_editor_event(
-        &self,
-        _operation: &'static str,
-        _file_extension: Option<String>,
-        _cx: &AppContext,
-    ) {
-    }
-
-    #[cfg(not(any(test, feature = "test-support")))]
     fn report_editor_event(
         &self,
         operation: &'static str,
         file_extension: Option<String>,
         cx: &AppContext,
     ) {
+        if cfg!(any(test, feature = "test-support")) {
+            return;
+        }
+
         let Some(project) = &self.project else { return };
 
         // If None, we are in a file without an extension
@@ -10112,6 +10231,12 @@ pub enum EditorEvent {
         autoscroll: bool,
     },
     Closed,
+    TransactionUndone {
+        transaction_id: clock::Lamport,
+    },
+    TransactionBegun {
+        transaction_id: clock::Lamport,
+    },
 }
 
 impl EventEmitter<EditorEvent> for Editor {}

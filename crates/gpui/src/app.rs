@@ -520,6 +520,11 @@ impl AppContext {
         self.platform.displays()
     }
 
+    /// Returns the primary display that will be used for new windows.
+    pub fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
+        self.platform.primary_display()
+    }
+
     /// Returns the appearance of the application's windows.
     pub fn window_appearance(&self) -> WindowAppearance {
         self.platform.window_appearance()
@@ -1127,6 +1132,17 @@ impl AppContext {
         self.platform.set_menus(menus, &self.keymap.borrow());
     }
 
+    /// Adds given path to list of recent paths for the application.
+    /// The list is usually shown on the application icon's context menu in the dock,
+    /// and allows to open the recent files via that context menu.
+    pub fn add_recent_documents(&mut self, paths: &[PathBuf]) {
+        self.platform.add_recent_documents(paths);
+    }
+
+    /// Clears the list of recent paths from the application.
+    pub fn clear_recent_documents(&mut self) {
+        self.platform.clear_recent_documents();
+    }
     /// Dispatch an action to the currently active window or global action handler
     /// See [action::Action] for more information on how actions work
     pub fn dispatch_action(&mut self, action: &dyn Action) {
@@ -1139,7 +1155,7 @@ impl AppContext {
         }
     }
 
-    pub(crate) fn dispatch_global_action(&mut self, action: &dyn Action) {
+    fn dispatch_global_action(&mut self, action: &dyn Action) {
         self.propagate_event = true;
 
         if let Some(mut global_listeners) = self

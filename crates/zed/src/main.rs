@@ -1,6 +1,8 @@
 // Allow binary to be called Zed for a nice application menu when running executable directly
 #![allow(non_snake_case)]
 
+mod zed;
+
 use anyhow::{anyhow, Context as _, Result};
 use backtrace::Backtrace;
 use chrono::Utc;
@@ -13,6 +15,7 @@ use env_logger::Builder;
 use fs::RealFs;
 use futures::{future, StreamExt};
 use gpui::{App, AppContext, AsyncAppContext, Context, SemanticVersion, Task};
+use image_viewer;
 use isahc::{prelude::Configurable, Request};
 use language::LanguageRegistry;
 use log::LevelFilter;
@@ -142,9 +145,9 @@ fn main() {
         ));
 
         let client = client::Client::new(clock, http.clone(), cx);
-        let mut languages = LanguageRegistry::new(login_shell_env_loaded);
+        let mut languages =
+            LanguageRegistry::new(login_shell_env_loaded, cx.background_executor().clone());
         let copilot_language_server_id = languages.next_language_server_id();
-        languages.set_executor(cx.background_executor().clone());
         languages.set_language_server_download_dir(paths::LANGUAGES_DIR.clone());
         let languages = Arc::new(languages);
         let node_runtime = RealNodeRuntime::new(http.clone());
@@ -163,6 +166,7 @@ fn main() {
         command_palette::init(cx);
         language::init(cx);
         editor::init(cx);
+        image_viewer::init(cx);
         diagnostics::init(cx);
         copilot::init(
             copilot_language_server_id,
@@ -170,7 +174,7 @@ fn main() {
             node_runtime.clone(),
             cx,
         );
-        assistant::init(cx);
+        assistant::init(client.clone(), cx);
 
         extension::init(
             fs.clone(),
@@ -184,8 +188,6 @@ fn main() {
         load_user_themes_in_background(fs.clone(), cx);
         watch_themes(fs.clone(), cx);
 
-        cx.spawn(|_| watch_languages(fs.clone(), languages.clone()))
-            .detach();
         watch_file_types(fs.clone(), cx);
 
         languages.set_theme(cx.theme().clone());
@@ -245,7 +247,6 @@ fn main() {
         tasks_ui::init(cx);
         channel::init(&client, user_store.clone(), cx);
         search::init(cx);
-        semantic_index::init(fs.clone(), http.clone(), languages.clone(), cx);
         vim::init(cx);
         terminal_view::init(cx);
 
@@ -264,24 +265,14 @@ fn main() {
         cx.set_menus(app_menus());
         initialize_workspace(app_state.clone(), cx);
 
-        if stdout_is_a_pty() {
-            // todo(linux): unblock this
-            #[cfg(not(target_os = "linux"))]
-            upload_panics_and_crashes(http.clone(), cx);
-            cx.activate(true);
-            let urls = collect_url_args(cx);
-            if !urls.is_empty() {
-                listener.open_urls(urls)
-            }
-        } else {
-            upload_panics_and_crashes(http.clone(), cx);
-            // TODO Development mode that forces the CLI mode usually runs Zed binary as is instead
-            // of an *app, hence gets no specific callbacks run. Emulate them here, if needed.
-            if std::env::var(FORCE_CLI_MODE_ENV_VAR_NAME).ok().is_some()
-                && !listener.triggered.load(Ordering::Acquire)
-            {
-                listener.open_urls(collect_url_args(cx))
-            }
+        // todo(linux): unblock this
+        upload_panics_and_crashes(http.clone(), cx);
+
+        cx.activate(true);
+
+        let urls = collect_url_args(cx);
+        if !urls.is_empty() {
+            listener.open_urls(urls)
         }
 
         let mut triggered_authentication = false;
@@ -339,8 +330,13 @@ fn handle_open_request(
     if !request.open_paths.is_empty() {
         let app_state = app_state.clone();
         task = Some(cx.spawn(|mut cx| async move {
-            let (_window, results) =
-                open_paths_with_positions(&request.open_paths, app_state, &mut cx).await?;
+            let (_window, results) = open_paths_with_positions(
+                &request.open_paths,
+                app_state,
+                workspace::OpenOptions::default(),
+                &mut cx,
+            )
+            .await?;
             for result in results.into_iter().flatten() {
                 if let Err(err) = result {
                     log::error!("Error opening path: {err}",);
@@ -441,9 +437,16 @@ async fn installation_id() -> Result<(String, bool)> {
 async fn restore_or_create_workspace(app_state: Arc<AppState>, cx: AsyncAppContext) {
     async_maybe!({
         if let Some(location) = workspace::last_opened_workspace_paths().await {
-            cx.update(|cx| workspace::open_paths(location.paths().as_ref(), app_state, None, cx))?
-                .await
-                .log_err();
+            cx.update(|cx| {
+                workspace::open_paths(
+                    location.paths().as_ref(),
+                    app_state,
+                    workspace::OpenOptions::default(),
+                    cx,
+                )
+            })?
+            .await
+            .log_err();
         } else if matches!(KEY_VALUE_STORE.read_kvp(FIRST_OPEN), Ok(None)) {
             cx.update(|cx| show_welcome_view(app_state, cx)).log_err();
         } else {
@@ -901,7 +904,7 @@ fn collect_url_args(cx: &AppContext) -> Vec<String> {
         .filter_map(|arg| match std::fs::canonicalize(Path::new(&arg)) {
             Ok(path) => Some(format!("file://{}", path.to_string_lossy())),
             Err(error) => {
-                if arg.starts_with("file://") {
+                if arg.starts_with("file://") || arg.starts_with("zed-cli://") {
                     Some(arg)
                 } else if let Some(_) = parse_zed_link(&arg, cx) {
                     Some(arg)
@@ -1003,31 +1006,19 @@ fn watch_themes(fs: Arc<dyn fs::Fs>, cx: &mut AppContext) {
 }
 
 #[cfg(debug_assertions)]
-async fn watch_languages(fs: Arc<dyn fs::Fs>, languages: Arc<LanguageRegistry>) {
-    use std::time::Duration;
-
-    let reload_debounce = Duration::from_millis(250);
-
-    let mut events = fs
-        .watch("crates/zed/src/languages".as_ref(), reload_debounce)
-        .await;
-
-    while (events.next().await).is_some() {
-        languages.reload();
-    }
-}
-
-#[cfg(debug_assertions)]
 fn watch_file_types(fs: Arc<dyn fs::Fs>, cx: &mut AppContext) {
     use std::time::Duration;
 
+    let path = {
+        let p = Path::new("assets/icons/file_icons/file_types.json");
+        let Ok(full_path) = p.canonicalize() else {
+            return;
+        };
+        full_path
+    };
+
     cx.spawn(|cx| async move {
-        let mut events = fs
-            .watch(
-                "assets/icons/file_icons/file_types.json".as_ref(),
-                Duration::from_millis(100),
-            )
-            .await;
+        let mut events = fs.watch(path.as_path(), Duration::from_millis(100)).await;
         while (events.next().await).is_some() {
             cx.update(|cx| {
                 cx.update_global(|file_types, _| {
@@ -1042,6 +1033,3 @@ fn watch_file_types(fs: Arc<dyn fs::Fs>, cx: &mut AppContext) {
 
 #[cfg(not(debug_assertions))]
 fn watch_file_types(_fs: Arc<dyn fs::Fs>, _cx: &mut AppContext) {}
-
-#[cfg(not(debug_assertions))]
-async fn watch_languages(_fs: Arc<dyn fs::Fs>, _languages: Arc<LanguageRegistry>) {}
