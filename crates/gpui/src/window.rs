@@ -21,6 +21,7 @@ use std::{
     any::{Any, TypeId},
     borrow::{Borrow, BorrowMut},
     cell::{Cell, RefCell},
+    collections::HashMap,
     fmt::{Debug, Display},
     future::Future,
     hash::{Hash, Hasher},
@@ -1989,6 +1990,8 @@ impl<T> BorrowWindow for T where T: BorrowMut<AppContext> + BorrowMut<Window> {}
 pub struct ViewContext<'a, V> {
     window_cx: WindowContext<'a>,
     view: &'a View<V>,
+    /// Extra payloads
+    pub extras: HashMap<String, String>,
 }
 
 impl<V> Borrow<AppContext> for ViewContext<'_, V> {
@@ -2020,6 +2023,7 @@ impl<'a, V: 'static> ViewContext<'a, V> {
         Self {
             window_cx: WindowContext::new(app, window),
             view,
+            extras: HashMap::default(),
         }
     }
 

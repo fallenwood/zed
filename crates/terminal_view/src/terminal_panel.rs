@@ -287,9 +287,29 @@ impl TerminalPanel {
         action: &workspace::OpenTerminal,
         cx: &mut ViewContext<Workspace>,
     ) {
+        {
+            let extras = &mut cx.extras;
+
+            {
+                println!("[XXX] Seting working_directory {:p}", extras);
+            }
+
+            extras.insert("terminal#working_directory".to_string(), String::from(action.working_directory.clone().to_string_lossy()));
+        }
+        
         let Some(this) = workspace.focus_panel::<Self>(cx) else {
             return;
         };
+
+        {
+            let extras = &mut cx.extras;
+
+            if extras.contains_key("terminal#set_active") {
+                println!("[XXX] Has set_active");
+                return;
+            }
+            println!("[XXX] Does not have set_active");
+        }
 
         this.update(cx, |this, cx| {
             this.add_terminal(Some(action.working_directory.clone()), None, cx)
@@ -704,6 +724,24 @@ impl Panel for TerminalPanel {
 
     fn set_active(&mut self, active: bool, cx: &mut ViewContext<Self>) {
         if active && self.pane.read(cx).items_len() == 0 && self.pending_terminals_to_add == 0 {
+            let extras = &mut cx.extras;
+
+            let working_directory = extras
+                .get("terminal#working_directory");
+
+            {
+                println!("[XXX] Get working_directory {} {:p}", working_directory.is_some(), extras);
+            }
+
+            let working_directory = working_directory
+                .map(|s| PathBuf::from(s));
+
+            println!("[XXX] Get parsed working_directory {}", working_directory.is_some());
+
+            extras.insert("terminal#set_active".to_string(), "true".to_string());
+
+            println!("[XXX] Setting set_active");
+
             self.add_terminal(None, None, cx)
         }
     }
