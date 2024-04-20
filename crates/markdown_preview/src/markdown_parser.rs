@@ -1,16 +1,23 @@
 use crate::markdown_elements::*;
+use async_recursion::async_recursion;
 use gpui::FontWeight;
+use language::LanguageRegistry;
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
-use std::{ops::Range, path::PathBuf};
+use std::{ops::Range, path::PathBuf, sync::Arc};
 
-pub fn parse_markdown(
+pub async fn parse_markdown(
     markdown_input: &str,
     file_location_directory: Option<PathBuf>,
+    language_registry: Option<Arc<LanguageRegistry>>,
 ) -> ParsedMarkdown {
     let options = Options::all();
     let parser = Parser::new_ext(markdown_input, options);
-    let parser = MarkdownParser::new(parser.into_offset_iter().collect(), file_location_directory);
-    let renderer = parser.parse_document();
+    let parser = MarkdownParser::new(
+        parser.into_offset_iter().collect(),
+        file_location_directory,
+        language_registry,
+    );
+    let renderer = parser.parse_document().await;
     ParsedMarkdown {
         children: renderer.parsed,
     }
@@ -23,16 +30,19 @@ struct MarkdownParser<'a> {
     /// The blocks that we have successfully parsed so far
     parsed: Vec<ParsedMarkdownElement>,
     file_location_directory: Option<PathBuf>,
+    language_registry: Option<Arc<LanguageRegistry>>,
 }
 
 impl<'a> MarkdownParser<'a> {
     fn new(
         tokens: Vec<(Event<'a>, Range<usize>)>,
         file_location_directory: Option<PathBuf>,
+        language_registry: Option<Arc<LanguageRegistry>>,
     ) -> Self {
         Self {
             tokens,
             file_location_directory,
+            language_registry,
             cursor: 0,
             parsed: vec![],
         }
@@ -63,6 +73,10 @@ impl<'a> MarkdownParser<'a> {
         return self.peek(0);
     }
 
+    fn current_event(&self) -> Option<&Event> {
+        return self.current().map(|(event, _)| event);
+    }
+
     fn is_text_like(event: &Event) -> bool {
         match event {
             Event::Text(_)
@@ -81,16 +95,16 @@ impl<'a> MarkdownParser<'a> {
         }
     }
 
-    fn parse_document(mut self) -> Self {
+    async fn parse_document(mut self) -> Self {
         while !self.eof() {
-            if let Some(block) = self.parse_block() {
+            if let Some(block) = self.parse_block().await {
                 self.parsed.push(block);
             }
         }
         self
     }
 
-    fn parse_block(&mut self) -> Option<ParsedMarkdownElement> {
+    async fn parse_block(&mut self) -> Option<ParsedMarkdownElement> {
         let (current, source_range) = self.current().unwrap();
         match current {
             Event::Start(tag) => match tag {
@@ -119,12 +133,12 @@ impl<'a> MarkdownParser<'a> {
                 Tag::List(order) => {
                     let order = *order;
                     self.cursor += 1;
-                    let list = self.parse_list(1, order);
+                    let list = self.parse_list(1, order).await;
                     Some(ParsedMarkdownElement::List(list))
                 }
                 Tag::BlockQuote => {
                     self.cursor += 1;
-                    let block_quote = self.parse_block_quote();
+                    let block_quote = self.parse_block_quote().await;
                     Some(ParsedMarkdownElement::BlockQuote(block_quote))
                 }
                 Tag::CodeBlock(kind) => {
@@ -141,7 +155,7 @@ impl<'a> MarkdownParser<'a> {
 
                     self.cursor += 1;
 
-                    let code_block = self.parse_code_block(language);
+                    let code_block = self.parse_code_block(language).await;
                     Some(ParsedMarkdownElement::CodeBlock(code_block))
                 }
                 _ => {
@@ -174,6 +188,9 @@ impl<'a> MarkdownParser<'a> {
         let mut regions: Vec<ParsedRegion> = vec![];
         let mut highlights: Vec<(Range<usize>, MarkdownHighlight)> = vec![];
 
+        let mut link_urls: Vec<String> = vec![];
+        let mut link_ranges: Vec<Range<usize>> = vec![];
+
         loop {
             if self.eof() {
                 break;
@@ -192,7 +209,7 @@ impl<'a> MarkdownParser<'a> {
                 }
 
                 Event::HardBreak => {
-                    break;
+                    text.push('\n');
                 }
 
                 Event::Text(t) => {
@@ -212,28 +229,69 @@ impl<'a> MarkdownParser<'a> {
                         style.strikethrough = true;
                     }
 
-                    if let Some(link) = link.clone() {
+                    let last_run_len = if let Some(link) = link.clone() {
                         region_ranges.push(prev_len..text.len());
                         regions.push(ParsedRegion {
                             code: false,
                             link: Some(link),
                         });
                         style.underline = true;
-                    }
+                        prev_len
+                    } else {
+                        // Manually scan for links
+                        let mut finder = linkify::LinkFinder::new();
+                        finder.kinds(&[linkify::LinkKind::Url]);
+                        let mut last_link_len = prev_len;
+                        for link in finder.links(&t) {
+                            let start = link.start();
+                            let end = link.end();
+                            let range = (prev_len + start)..(prev_len + end);
+                            link_ranges.push(range.clone());
+                            link_urls.push(link.as_str().to_string());
 
-                    if style != MarkdownHighlightStyle::default() {
+                            // If there is a style before we match a link, we have to add this to the highlighted ranges
+                            if style != MarkdownHighlightStyle::default()
+                                && last_link_len < link.start()
+                            {
+                                highlights.push((
+                                    last_link_len..link.start(),
+                                    MarkdownHighlight::Style(style.clone()),
+                                ));
+                            }
+
+                            highlights.push((
+                                range.clone(),
+                                MarkdownHighlight::Style(MarkdownHighlightStyle {
+                                    underline: true,
+                                    ..style
+                                }),
+                            ));
+                            region_ranges.push(range.clone());
+                            regions.push(ParsedRegion {
+                                code: false,
+                                link: Some(Link::Web {
+                                    url: link.as_str().to_string(),
+                                }),
+                            });
+
+                            last_link_len = end;
+                        }
+                        last_link_len
+                    };
+
+                    if style != MarkdownHighlightStyle::default() && last_run_len < text.len() {
                         let mut new_highlight = true;
-                        if let Some((last_range, MarkdownHighlight::Style(last_style))) =
-                            highlights.last_mut()
-                        {
-                            if last_range.end == prev_len && last_style == &style {
+                        if let Some((last_range, last_style)) = highlights.last_mut() {
+                            if last_range.end == last_run_len
+                                && last_style == &MarkdownHighlight::Style(style.clone())
+                            {
                                 last_range.end = text.len();
                                 new_highlight = false;
                             }
                         }
                         if new_highlight {
-                            let range = prev_len..text.len();
-                            highlights.push((range, MarkdownHighlight::Style(style)));
+                            highlights
+                                .push((last_run_len..text.len(), MarkdownHighlight::Style(style)));
                         }
                     }
                 }
@@ -407,7 +465,8 @@ impl<'a> MarkdownParser<'a> {
         }
     }
 
-    fn parse_list(&mut self, depth: u16, order: Option<u64>) -> ParsedMarkdownList {
+    #[async_recursion]
+    async fn parse_list(&mut self, depth: u16, order: Option<u64>) -> ParsedMarkdownList {
         let (_event, source_range) = self.previous().unwrap();
         let source_range = source_range.clone();
         let mut children = vec![];
@@ -424,7 +483,7 @@ impl<'a> MarkdownParser<'a> {
                     let order = *order;
                     self.cursor += 1;
 
-                    let inner_list = self.parse_list(depth + 1, order);
+                    let inner_list = self.parse_list(depth + 1, order).await;
                     let block = ParsedMarkdownElement::List(inner_list);
                     current_list_items.push(Box::new(block));
                 }
@@ -437,36 +496,43 @@ impl<'a> MarkdownParser<'a> {
                     inside_list_item = true;
 
                     // Check for task list marker (`- [ ]` or `- [x]`)
-                    if let Some(next) = self.current() {
-                        match next.0 {
-                            Event::TaskListMarker(checked) => {
-                                task_item = Some(checked);
-                                self.cursor += 1;
-                            }
-                            _ => {}
+                    if let Some(event) = self.current_event() {
+                        // If there is a linebreak in between two list items the task list marker will actually be the first element of the paragraph
+                        if event == &Event::Start(Tag::Paragraph) {
+                            self.cursor += 1;
+                        }
+
+                        if let Some((Event::TaskListMarker(checked), range)) = self.current() {
+                            task_item = Some((*checked, range.clone()));
+                            self.cursor += 1;
                         }
                     }
 
-                    if let Some(next) = self.current() {
+                    if let Some(event) = self.current_event() {
                         // This is a plain list item.
                         // For example `- some text` or `1. [Docs](./docs.md)`
-                        if MarkdownParser::is_text_like(&next.0) {
+                        if MarkdownParser::is_text_like(event) {
                             let text = self.parse_text(false);
                             let block = ParsedMarkdownElement::Paragraph(text);
                             current_list_items.push(Box::new(block));
                         } else {
-                            let block = self.parse_block();
+                            let block = self.parse_block().await;
                             if let Some(block) = block {
                                 current_list_items.push(Box::new(block));
                             }
                         }
                     }
+
+                    // If there is a linebreak in between two list items the task list marker will actually be the first element of the paragraph
+                    if self.current_event() == Some(&Event::End(TagEnd::Paragraph)) {
+                        self.cursor += 1;
+                    }
                 }
                 Event::End(TagEnd::Item) => {
                     self.cursor += 1;
 
-                    let item_type = if let Some(checked) = task_item {
-                        ParsedMarkdownListItemType::Task(checked)
+                    let item_type = if let Some((checked, range)) = task_item {
+                        ParsedMarkdownListItemType::Task(checked, range)
                     } else if let Some(order) = order {
                         ParsedMarkdownListItemType::Ordered(order)
                     } else {
@@ -493,7 +559,7 @@ impl<'a> MarkdownParser<'a> {
                         break;
                     }
 
-                    let block = self.parse_block();
+                    let block = self.parse_block().await;
                     if let Some(block) = block {
                         current_list_items.push(Box::new(block));
                     }
@@ -507,7 +573,8 @@ impl<'a> MarkdownParser<'a> {
         }
     }
 
-    fn parse_block_quote(&mut self) -> ParsedMarkdownBlockQuote {
+    #[async_recursion]
+    async fn parse_block_quote(&mut self) -> ParsedMarkdownBlockQuote {
         let (_event, source_range) = self.previous().unwrap();
         let source_range = source_range.clone();
         let mut nested_depth = 1;
@@ -515,7 +582,7 @@ impl<'a> MarkdownParser<'a> {
         let mut children: Vec<Box<ParsedMarkdownElement>> = vec![];
 
         while !self.eof() {
-            let block = self.parse_block();
+            let block = self.parse_block().await;
 
             if let Some(block) = block {
                 children.push(Box::new(block));
@@ -553,7 +620,7 @@ impl<'a> MarkdownParser<'a> {
         }
     }
 
-    fn parse_code_block(&mut self, language: Option<String>) -> ParsedMarkdownCodeBlock {
+    async fn parse_code_block(&mut self, language: Option<String>) -> ParsedMarkdownCodeBlock {
         let (_event, source_range) = self.previous().unwrap();
         let source_range = source_range.clone();
         let mut code = String::new();
@@ -575,10 +642,26 @@ impl<'a> MarkdownParser<'a> {
             }
         }
 
+        let highlights = if let Some(language) = &language {
+            if let Some(registry) = &self.language_registry {
+                let rope: language::Rope = code.as_str().into();
+                registry
+                    .language_for_name_or_extension(language)
+                    .await
+                    .map(|l| l.highlight_text(&rope, 0..code.len()))
+                    .ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         ParsedMarkdownCodeBlock {
             source_range,
             contents: code.trim().to_string().into(),
             language,
+            highlights,
         }
     }
 }
@@ -587,18 +670,20 @@ impl<'a> MarkdownParser<'a> {
 mod tests {
     use super::*;
 
+    use gpui::BackgroundExecutor;
+    use language::{tree_sitter_rust, HighlightId, Language, LanguageConfig, LanguageMatcher};
     use pretty_assertions::assert_eq;
 
     use ParsedMarkdownElement::*;
     use ParsedMarkdownListItemType::*;
 
-    fn parse(input: &str) -> ParsedMarkdown {
-        parse_markdown(input, None)
+    async fn parse(input: &str) -> ParsedMarkdown {
+        parse_markdown(input, None, None).await
     }
 
-    #[test]
-    fn test_headings() {
-        let parsed = parse("# Heading one\n## Heading two\n### Heading three");
+    #[gpui::test]
+    async fn test_headings() {
+        let parsed = parse("# Heading one\n## Heading two\n### Heading three").await;
 
         assert_eq!(
             parsed.children,
@@ -610,9 +695,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_newlines_dont_new_paragraphs() {
-        let parsed = parse("Some text **that is bolded**\n and *italicized*");
+    #[gpui::test]
+    async fn test_newlines_dont_new_paragraphs() {
+        let parsed = parse("Some text **that is bolded**\n and *italicized*").await;
 
         assert_eq!(
             parsed.children,
@@ -620,9 +705,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_heading_with_paragraph() {
-        let parsed = parse("# Zed\nThe editor");
+    #[gpui::test]
+    async fn test_heading_with_paragraph() {
+        let parsed = parse("# Zed\nThe editor").await;
 
         assert_eq!(
             parsed.children,
@@ -630,9 +715,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_double_newlines_do_new_paragraphs() {
-        let parsed = parse("Some text **that is bolded**\n\n and *italicized*");
+    #[gpui::test]
+    async fn test_double_newlines_do_new_paragraphs() {
+        let parsed = parse("Some text **that is bolded**\n\n and *italicized*").await;
 
         assert_eq!(
             parsed.children,
@@ -643,9 +728,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_bold_italic_text() {
-        let parsed = parse("Some text **that is bolded** and *italicized*");
+    #[gpui::test]
+    async fn test_bold_italic_text() {
+        let parsed = parse("Some text **that is bolded** and *italicized*").await;
 
         assert_eq!(
             parsed.children,
@@ -653,9 +738,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_nested_bold_strikethrough_text() {
-        let parsed = parse("Some **bo~~strikethrough~~ld** text");
+    #[gpui::test]
+    async fn test_nested_bold_strikethrough_text() {
+        let parsed = parse("Some **bo~~strikethrough~~ld** text").await;
 
         assert_eq!(parsed.children.len(), 1);
         assert_eq!(
@@ -703,8 +788,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_header_only_table() {
+    #[gpui::test]
+    async fn test_raw_links_detection() {
+        let parsed = parse("Checkout this https://zed.dev link").await;
+
+        assert_eq!(
+            parsed.children,
+            vec![p("Checkout this https://zed.dev link", 0..34)]
+        );
+
+        let paragraph = if let ParsedMarkdownElement::Paragraph(text) = &parsed.children[0] {
+            text
+        } else {
+            panic!("Expected a paragraph");
+        };
+        assert_eq!(
+            paragraph.highlights,
+            vec![(
+                14..29,
+                MarkdownHighlight::Style(MarkdownHighlightStyle {
+                    underline: true,
+                    ..Default::default()
+                }),
+            )]
+        );
+        assert_eq!(
+            paragraph.regions,
+            vec![ParsedRegion {
+                code: false,
+                link: Some(Link::Web {
+                    url: "https://zed.dev".to_string()
+                }),
+            }]
+        );
+        assert_eq!(paragraph.region_ranges, vec![14..29]);
+    }
+
+    #[gpui::test]
+    async fn test_header_only_table() {
         let markdown = "\
 | Header 1 | Header 2 |
 |----------|----------|
@@ -719,13 +840,13 @@ Some other content
         );
 
         assert_eq!(
-            parse(markdown).children[0],
+            parse(markdown).await.children[0],
             ParsedMarkdownElement::Table(expected_table)
         );
     }
 
-    #[test]
-    fn test_basic_table() {
+    #[gpui::test]
+    async fn test_basic_table() {
         let markdown = "\
 | Header 1 | Header 2 |
 |----------|----------|
@@ -742,20 +863,21 @@ Some other content
         );
 
         assert_eq!(
-            parse(markdown).children[0],
+            parse(markdown).await.children[0],
             ParsedMarkdownElement::Table(expected_table)
         );
     }
 
-    #[test]
-    fn test_list_basic() {
+    #[gpui::test]
+    async fn test_list_basic() {
         let parsed = parse(
             "\
 * Item 1
 * Item 2
 * Item 3
 ",
-        );
+        )
+        .await;
 
         assert_eq!(
             parsed.children,
@@ -770,29 +892,53 @@ Some other content
         );
     }
 
-    #[test]
-    fn test_list_with_tasks() {
+    #[gpui::test]
+    async fn test_list_with_tasks() {
         let parsed = parse(
             "\
 - [ ] TODO
 - [x] Checked
 ",
-        );
+        )
+        .await;
 
         assert_eq!(
             parsed.children,
             vec![list(
                 vec![
-                    list_item(1, Task(false), vec![p("TODO", 2..5)]),
-                    list_item(1, Task(true), vec![p("Checked", 13..16)]),
+                    list_item(1, Task(false, 2..5), vec![p("TODO", 2..5)]),
+                    list_item(1, Task(true, 13..16), vec![p("Checked", 13..16)]),
                 ],
                 0..25
             ),]
         );
     }
 
-    #[test]
-    fn test_list_nested() {
+    #[gpui::test]
+    async fn test_list_with_linebreak_is_handled_correctly() {
+        let parsed = parse(
+            "\
+- [ ] Task 1
+
+- [x] Task 2
+",
+        )
+        .await;
+
+        assert_eq!(
+            parsed.children,
+            vec![list(
+                vec![
+                    list_item(1, Task(false, 2..5), vec![p("Task 1", 2..5)]),
+                    list_item(1, Task(true, 16..19), vec![p("Task 2", 16..19)]),
+                ],
+                0..27
+            ),]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_list_nested() {
         let parsed = parse(
             "\
 * Item 1
@@ -813,7 +959,8 @@ Some other content
   2. Goodbyte
 * Last
 ",
-        );
+        )
+        .await;
 
         assert_eq!(
             parsed.children,
@@ -900,14 +1047,15 @@ Some other content
         );
     }
 
-    #[test]
-    fn test_list_with_nested_content() {
+    #[gpui::test]
+    async fn test_list_with_nested_content() {
         let parsed = parse(
             "\
 *   This is a list item with two paragraphs.
 
     This is the second paragraph in the list item.",
-        );
+        )
+        .await;
 
         assert_eq!(
             parsed.children,
@@ -925,15 +1073,16 @@ Some other content
         );
     }
 
-    #[test]
-    fn test_list_with_leading_text() {
+    #[gpui::test]
+    async fn test_list_with_leading_text() {
         let parsed = parse(
             "\
 * `code`
 * **bold**
 * [link](https://example.com)
 ",
-        );
+        )
+        .await;
 
         assert_eq!(
             parsed.children,
@@ -948,9 +1097,9 @@ Some other content
         );
     }
 
-    #[test]
-    fn test_simple_block_quote() {
-        let parsed = parse("> Simple block quote with **styled text**");
+    #[gpui::test]
+    async fn test_simple_block_quote() {
+        let parsed = parse("> Simple block quote with **styled text**").await;
 
         assert_eq!(
             parsed.children,
@@ -961,8 +1110,8 @@ Some other content
         );
     }
 
-    #[test]
-    fn test_simple_block_quote_with_multiple_lines() {
+    #[gpui::test]
+    async fn test_simple_block_quote_with_multiple_lines() {
         let parsed = parse(
             "\
 > # Heading
@@ -971,7 +1120,8 @@ Some other content
 >
 > More text
 ",
-        );
+        )
+        .await;
 
         assert_eq!(
             parsed.children,
@@ -986,8 +1136,8 @@ Some other content
         );
     }
 
-    #[test]
-    fn test_nested_block_quote() {
+    #[gpui::test]
+    async fn test_nested_block_quote() {
         let parsed = parse(
             "\
 > A
@@ -998,7 +1148,8 @@ Some other content
 
 More text
 ",
-        );
+        )
+        .await;
 
         assert_eq!(
             parsed.children,
@@ -1016,8 +1167,8 @@ More text
         );
     }
 
-    #[test]
-    fn test_code_block() {
+    #[gpui::test]
+    async fn test_code_block() {
         let parsed = parse(
             "\
 ```
@@ -1026,17 +1177,26 @@ fn main() {
 }
 ```
 ",
-        );
+        )
+        .await;
 
         assert_eq!(
             parsed.children,
-            vec![code_block(None, "fn main() {\n    return 0;\n}", 0..35)]
+            vec![code_block(
+                None,
+                "fn main() {\n    return 0;\n}",
+                0..35,
+                None
+            )]
         );
     }
 
-    #[test]
-    fn test_code_block_with_language() {
-        let parsed = parse(
+    #[gpui::test]
+    async fn test_code_block_with_language(executor: BackgroundExecutor) {
+        let language_registry = Arc::new(LanguageRegistry::test(executor.clone()));
+        language_registry.add(rust_lang());
+
+        let parsed = parse_markdown(
             "\
 ```rust
 fn main() {
@@ -1044,16 +1204,35 @@ fn main() {
 }
 ```
 ",
-        );
+            None,
+            Some(language_registry),
+        )
+        .await;
 
         assert_eq!(
             parsed.children,
             vec![code_block(
-                Some("rust".into()),
+                Some("rust".to_string()),
                 "fn main() {\n    return 0;\n}",
-                0..39
+                0..39,
+                Some(vec![])
             )]
         );
+    }
+
+    fn rust_lang() -> Arc<Language> {
+        Arc::new(Language::new(
+            LanguageConfig {
+                name: "Rust".into(),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["rs".into()],
+                    ..Default::default()
+                },
+                collapsed_placeholder: " /* ... */ ".to_string(),
+                ..Default::default()
+            },
+            Some(tree_sitter_rust::language()),
+        ))
     }
 
     fn h1(contents: ParsedMarkdownText, source_range: Range<usize>) -> ParsedMarkdownElement {
@@ -1108,11 +1287,13 @@ fn main() {
         language: Option<String>,
         code: &str,
         source_range: Range<usize>,
+        highlights: Option<Vec<(Range<usize>, HighlightId)>>,
     ) -> ParsedMarkdownElement {
         ParsedMarkdownElement::CodeBlock(ParsedMarkdownCodeBlock {
             source_range,
             language,
             contents: code.to_string().into(),
+            highlights,
         })
     }
 

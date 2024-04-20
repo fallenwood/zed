@@ -1,5 +1,6 @@
 [package]
 name = "semantic_index"
+description = "Process, chunk, and embed text as vectors for semantic search."
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -10,57 +11,38 @@ workspace = true
 
 [lib]
 path = "src/semantic_index.rs"
-doctest = false
 
 [dependencies]
-ai.workspace = true
 anyhow.workspace = true
+client.workspace = true
+clock.workspace = true
 collections.workspace = true
+fs.workspace = true
 futures.workspace = true
+futures-batch.workspace = true
 gpui.workspace = true
 language.workspace = true
-lazy_static.workspace = true
 log.workspace = true
-ndarray = { version = "0.15.0" }
-ordered-float.workspace = true
-parking_lot.workspace = true
-postage.workspace = true
+heed.workspace = true
+open_ai.workspace = true
 project.workspace = true
-rand.workspace = true
-release_channel.workspace = true
-rpc.workspace = true
-rusqlite.workspace = true
-schemars.workspace = true
+settings.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-settings.workspace = true
-sha1 = "0.10.5"
+sha2.workspace = true
 smol.workspace = true
-tree-sitter.workspace = true
-util.workspace = true
-workspace.workspace = true
+util. workspace = true
+worktree.workspace = true
 
 [dev-dependencies]
-ai = { workspace = true, features = ["test-support"] }
-collections = { workspace = true, features = ["test-support"] }
-ctor.workspace = true
 env_logger.workspace = true
+client = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
+futures.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 language = { workspace = true, features = ["test-support"] }
-pretty_assertions.workspace = true
+languages.workspace = true
 project = { workspace = true, features = ["test-support"] }
-rand.workspace = true
-rpc = { workspace = true, features = ["test-support"] }
-settings = { workspace = true, features = ["test-support"]}
 tempfile.workspace = true
-tree-sitter-cpp.workspace = true
-tree-sitter-elixir.workspace = true
-tree-sitter-json.workspace = true
-tree-sitter-lua.workspace = true
-tree-sitter-php.workspace = true
-tree-sitter-ruby.workspace = true
-tree-sitter-rust.workspace = true
-tree-sitter-toml.workspace = true
-tree-sitter-typescript.workspace = true
-unindent.workspace = true
-workspace = { workspace = true, features = ["test-support"] }
+util = { workspace = true, features = ["test-support"] }
+worktree = { workspace = true, features = ["test-support"] }

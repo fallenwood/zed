@@ -1,4 +1,4 @@
-use gpui::{rems, svg, IntoElement, Rems};
+use gpui::{svg, IntoElement, Rems, Transformation};
 use strum::EnumIter;
 
 use crate::prelude::*;
@@ -15,10 +15,10 @@ pub enum IconSize {
 impl IconSize {
     pub fn rems(self) -> Rems {
         match self {
-            IconSize::Indicator => rems(10. / 16.),
-            IconSize::XSmall => rems(12. / 16.),
-            IconSize::Small => rems(14. / 16.),
-            IconSize::Medium => rems(16. / 16.),
+            IconSize::Indicator => rems_from_px(10.),
+            IconSize::XSmall => rems_from_px(12.),
+            IconSize::Small => rems_from_px(14.),
+            IconSize::Medium => rems_from_px(16.),
         }
     }
 }
@@ -47,6 +47,7 @@ pub enum IconName {
     ChevronLeft,
     ChevronRight,
     ChevronUp,
+    ExpandVertical,
     Close,
     Collab,
     Command,
@@ -93,27 +94,35 @@ pub enum IconName {
     Option,
     PageDown,
     PageUp,
+    Pencil,
+    Person,
     Play,
     Plus,
     Public,
     Quote,
+    Regex,
     Replace,
     ReplaceAll,
     ReplaceNext,
     Return,
-    ReplyArrow,
+    ReplyArrowRight,
+    Settings,
+    Sliders,
     Screen,
     SelectAll,
+    Server,
     Shift,
     Snip,
     Space,
     Split,
     Tab,
     Terminal,
+    Trash,
     Update,
     WholeWord,
     XCircle,
     ZedXCopilot,
+    PullRequest,
 }
 
 impl IconName {
@@ -141,6 +150,7 @@ impl IconName {
             IconName::ChevronLeft => "icons/chevron_left.svg",
             IconName::ChevronRight => "icons/chevron_right.svg",
             IconName::ChevronUp => "icons/chevron_up.svg",
+            IconName::ExpandVertical => "icons/expand_vertical.svg",
             IconName::Close => "icons/x.svg",
             IconName::Collab => "icons/user_group_16.svg",
             IconName::Command => "icons/command.svg",
@@ -187,27 +197,35 @@ impl IconName {
             IconName::Option => "icons/option.svg",
             IconName::PageDown => "icons/page_down.svg",
             IconName::PageUp => "icons/page_up.svg",
+            IconName::Person => "icons/person.svg",
+            IconName::Pencil => "icons/pencil.svg",
             IconName::Play => "icons/play.svg",
             IconName::Plus => "icons/plus.svg",
             IconName::Public => "icons/public.svg",
             IconName::Quote => "icons/quote.svg",
+            IconName::Regex => "icons/regex.svg",
             IconName::Replace => "icons/replace.svg",
             IconName::ReplaceAll => "icons/replace_all.svg",
             IconName::ReplaceNext => "icons/replace_next.svg",
             IconName::Return => "icons/return.svg",
-            IconName::ReplyArrow => "icons/reply_arrow.svg",
+            IconName::ReplyArrowRight => "icons/reply_arrow_right.svg",
+            IconName::Settings => "icons/file_icons/settings.svg",
+            IconName::Sliders => "icons/sliders.svg",
             IconName::Screen => "icons/desktop.svg",
             IconName::SelectAll => "icons/select_all.svg",
+            IconName::Server => "icons/server.svg",
             IconName::Shift => "icons/shift.svg",
             IconName::Snip => "icons/snip.svg",
             IconName::Space => "icons/space.svg",
             IconName::Split => "icons/split.svg",
             IconName::Tab => "icons/tab.svg",
             IconName::Terminal => "icons/terminal.svg",
+            IconName::Trash => "icons/trash.svg",
             IconName::Update => "icons/update.svg",
             IconName::WholeWord => "icons/word_search.svg",
             IconName::XCircle => "icons/error.svg",
             IconName::ZedXCopilot => "icons/zed_x_copilot.svg",
+            IconName::PullRequest => "icons/pull_request.svg",
         }
     }
 }
@@ -217,6 +235,7 @@ pub struct Icon {
     path: SharedString,
     color: Color,
     size: IconSize,
+    transformation: Transformation,
 }
 
 impl Icon {
@@ -225,6 +244,7 @@ impl Icon {
             path: icon.path().into(),
             color: Color::default(),
             size: IconSize::default(),
+            transformation: Transformation::default(),
         }
     }
 
@@ -233,6 +253,7 @@ impl Icon {
             path: path.into(),
             color: Color::default(),
             size: IconSize::default(),
+            transformation: Transformation::default(),
         }
     }
 
@@ -245,11 +266,17 @@ impl Icon {
         self.size = size;
         self
     }
+
+    pub fn transform(mut self, transformation: Transformation) -> Self {
+        self.transformation = transformation;
+        self
+    }
 }
 
 impl RenderOnce for Icon {
     fn render(self, cx: &mut WindowContext) -> impl IntoElement {
         svg()
+            .with_transformation(self.transformation)
             .size(self.size.rems())
             .flex_none()
             .path(self.path)

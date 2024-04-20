@@ -1,8 +1,10 @@
 use crate::http::HttpClient;
 use anyhow::{anyhow, bail, Context, Result};
 use futures::AsyncReadExt;
+use isahc::{config::Configurable, AsyncBody, Request};
 use serde::Deserialize;
 use std::sync::Arc;
+use url::Url;
 
 pub struct GitHubLspBinaryVersion {
     pub name: String,
@@ -23,6 +25,89 @@ pub struct GithubRelease {
 pub struct GithubReleaseAsset {
     pub name: String,
     pub browser_download_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitDetails {
+    commit: Commit,
+    author: Option<User>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Commit {
+    author: Author,
+}
+
+#[derive(Debug, Deserialize)]
+struct Author {
+    name: String,
+    email: String,
+    date: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct User {
+    pub login: String,
+    pub id: u64,
+    pub node_id: String,
+    pub avatar_url: String,
+    pub gravatar_id: String,
+}
+
+#[derive(Debug)]
+pub struct GitHubAuthor {
+    pub id: u64,
+    pub email: String,
+    pub avatar_url: String,
+}
+
+pub async fn fetch_github_commit_author(
+    repo_owner: &str,
+    repo: &str,
+    commit: &str,
+    client: &Arc<dyn HttpClient>,
+) -> Result<Option<GitHubAuthor>> {
+    let url = format!("https://api.github.com/repos/{repo_owner}/{repo}/commits/{commit}");
+
+    let mut request = Request::get(&url)
+        .redirect_policy(isahc::config::RedirectPolicy::Follow)
+        .header("Content-Type", "application/json");
+
+    if let Ok(github_token) = std::env::var("GITHUB_TOKEN") {
+        request = request.header("Authorization", format!("Bearer {}", github_token));
+    }
+
+    let mut response = client
+        .send(request.body(AsyncBody::default())?)
+        .await
+        .with_context(|| format!("error fetching GitHub commit details at {:?}", url))?;
+
+    let mut body = Vec::new();
+    response.body_mut().read_to_end(&mut body).await?;
+
+    if response.status().is_client_error() {
+        let text = String::from_utf8_lossy(body.as_slice());
+        bail!(
+            "status error {}, response: {text:?}",
+            response.status().as_u16()
+        );
+    }
+
+    let body_str = std::str::from_utf8(&body)?;
+
+    serde_json::from_str::<CommitDetails>(body_str)
+        .map(|github_commit| {
+            if let Some(author) = github_commit.author {
+                Some(GitHubAuthor {
+                    id: author.id,
+                    avatar_url: author.avatar_url,
+                    email: github_commit.commit.author.email,
+                })
+            } else {
+                None
+            }
+        })
+        .context("deserializing GitHub commit details failed")
 }
 
 pub async fn latest_github_release(
@@ -73,4 +158,35 @@ pub async fn latest_github_release(
         .filter(|release| !require_assets || !release.assets.is_empty())
         .find(|release| release.pre_release == pre_release)
         .ok_or(anyhow!("Failed to find a release"))
+}
+
+pub fn build_tarball_url(repo_name_with_owner: &str, tag: &str) -> Result<String> {
+    let mut url = Url::parse(&format!(
+        "https://github.com/{repo_name_with_owner}/archive/refs/tags",
+    ))?;
+    // We're pushing this here, because tags may contain `/` and other characters
+    // that need to be escaped.
+    let tarball_filename = format!("{}.tar.gz", tag);
+    url.path_segments_mut()
+        .map_err(|_| anyhow!("cannot modify url path segments"))?
+        .push(&tarball_filename);
+    Ok(url.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::github::build_tarball_url;
+
+    #[test]
+    fn test_build_tarball_url() {
+        let tag = "release/2.3.5";
+        let repo_name_with_owner = "microsoft/vscode-eslint";
+
+        let have = build_tarball_url(repo_name_with_owner, tag).unwrap();
+
+        assert_eq!(
+            have,
+            "https://github.com/microsoft/vscode-eslint/archive/refs/tags/release%2F2.3.5.tar.gz"
+        );
+    }
 }

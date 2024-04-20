@@ -10,8 +10,17 @@ use schemars::{
     JsonSchema,
 };
 use serde::{Deserialize, Serialize};
-use settings::Settings;
+use settings::{Settings, SettingsLocation, SettingsSources};
 use std::{num::NonZeroU32, path::Path, sync::Arc};
+
+impl<'a> Into<SettingsLocation<'a>> for &'a dyn File {
+    fn into(self) -> SettingsLocation<'a> {
+        SettingsLocation {
+            worktree_id: self.worktree_id(),
+            path: self.path().as_ref(),
+        }
+    }
+}
 
 /// Initializes the language settings.
 pub fn init(cx: &mut AppContext) {
@@ -33,7 +42,7 @@ pub fn all_language_settings<'a>(
     file: Option<&Arc<dyn File>>,
     cx: &'a AppContext,
 ) -> &'a AllLanguageSettings {
-    let location = file.map(|f| (f.worktree_id(), f.path().as_ref()));
+    let location = file.map(|f| f.as_ref().into());
     AllLanguageSettings::get(location, cx)
 }
 
@@ -44,6 +53,7 @@ pub struct AllLanguageSettings {
     pub copilot: CopilotSettings,
     defaults: LanguageSettings,
     languages: HashMap<Arc<str>, LanguageSettings>,
+    pub(crate) file_types: HashMap<Arc<str>, Vec<String>>,
 }
 
 /// The settings for a particular language.
@@ -77,7 +87,7 @@ pub struct LanguageSettings {
     /// How to perform a buffer format.
     pub formatter: Formatter,
     /// Zed's Prettier integration settings.
-    /// If Prettier is enabled, Zed will use this its Prettier instance for any applicable file, if
+    /// If Prettier is enabled, Zed will use this for its Prettier instance for any applicable file, if
     /// the project has no other Prettier installed.
     pub prettier: HashMap<String, serde_json::Value>,
     /// Whether to use language servers to provide code intelligence.
@@ -93,6 +103,8 @@ pub struct LanguageSettings {
     pub inlay_hints: InlayHintSettings,
     /// Whether to automatically close brackets.
     pub use_autoclose: bool,
+    // Controls how the editor handles the autoclosed characters.
+    pub always_treat_brackets_as_autoclosed: bool,
     /// Which code actions to run on save
     pub code_actions_on_format: HashMap<String, bool>,
 }
@@ -107,7 +119,7 @@ pub struct CopilotSettings {
 }
 
 /// The settings for all languages.
-#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AllLanguageSettingsContent {
     /// The settings for enabling/disabling features.
     #[serde(default)]
@@ -121,10 +133,14 @@ pub struct AllLanguageSettingsContent {
     /// The settings for individual languages.
     #[serde(default, alias = "language_overrides")]
     pub languages: HashMap<Arc<str>, LanguageSettingsContent>,
+    /// Settings for associating file extensions and filenames
+    /// with languages.
+    #[serde(default)]
+    pub file_types: HashMap<Arc<str>, Vec<String>>,
 }
 
 /// The settings for a particular language.
-#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct LanguageSettingsContent {
     /// How many columns a tab should occupy.
     ///
@@ -184,7 +200,7 @@ pub struct LanguageSettingsContent {
     #[serde(default)]
     pub formatter: Option<Formatter>,
     /// Zed's Prettier integration settings.
-    /// If Prettier is enabled, Zed will use this its Prettier instance for any applicable file, if
+    /// If Prettier is enabled, Zed will use this for its Prettier instance for any applicable file, if
     /// the project has no other Prettier installed.
     ///
     /// Default: {}
@@ -217,15 +233,23 @@ pub struct LanguageSettingsContent {
     ///
     /// Default: true
     pub use_autoclose: Option<bool>,
-
-    /// Which code actions to run on save
+    // Controls how the editor handles the autoclosed characters.
+    // When set to `false`(default), skipping over and auto-removing of the closing characters
+    // happen only for auto-inserted characters.
+    // Otherwise(when `true`), the closing characters are always skipped over and auto-removed
+    // no matter how they were inserted.
+    ///
+    /// Default: false
+    pub always_treat_brackets_as_autoclosed: Option<bool>,
+    /// Which code actions to run on save after the formatter.
+    /// These are not run if formatting is off.
     ///
     /// Default: {} (or {"source.organizeImports": true} for Go).
     pub code_actions_on_format: Option<HashMap<String, bool>>,
 }
 
 /// The contents of the GitHub Copilot settings.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CopilotSettingsContent {
     /// A list of globs representing files that Copilot should be disabled for.
     #[serde(default)]
@@ -233,7 +257,7 @@ pub struct CopilotSettingsContent {
 }
 
 /// The settings for enabling/disabling features.
-#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct FeaturesContent {
     /// Whether the GitHub Copilot feature is enabled.
@@ -269,6 +293,8 @@ pub enum FormatOnSave {
         /// The arguments to pass to the program.
         arguments: Arc<[String]>,
     },
+    /// Files should be formatted using code actions executed by language servers.
+    CodeActions(HashMap<String, bool>),
 }
 
 /// Controls how whitespace should be displayedin the editor.
@@ -302,6 +328,8 @@ pub enum Formatter {
         /// The arguments to pass to the program.
         arguments: Arc<[String]>,
     },
+    /// Files should be formatted using code actions executed by language servers.
+    CodeActions(HashMap<String, bool>),
 }
 
 /// The settings for inlay hints.
@@ -445,11 +473,9 @@ impl settings::Settings for AllLanguageSettings {
 
     type FileContent = AllLanguageSettingsContent;
 
-    fn load(
-        default_value: &Self::FileContent,
-        user_settings: &[&Self::FileContent],
-        _: &mut AppContext,
-    ) -> Result<Self> {
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
+        let default_value = sources.default;
+
         // A default is provided for all settings.
         let mut defaults: LanguageSettings =
             serde_json::from_value(serde_json::to_value(&default_value.defaults)?)?;
@@ -472,7 +498,8 @@ impl settings::Settings for AllLanguageSettings {
             .and_then(|c| c.disabled_globs.as_ref())
             .ok_or_else(Self::missing_default)?;
 
-        for user_settings in user_settings {
+        let mut file_types: HashMap<Arc<str>, Vec<String>> = HashMap::default();
+        for user_settings in sources.customizations() {
             if let Some(copilot) = user_settings.features.as_ref().and_then(|f| f.copilot) {
                 copilot_enabled = copilot;
             }
@@ -500,6 +527,13 @@ impl settings::Settings for AllLanguageSettings {
                     user_language_settings,
                 );
             }
+
+            for (language, suffixes) in &user_settings.file_types {
+                file_types
+                    .entry(language.clone())
+                    .or_default()
+                    .extend_from_slice(suffixes);
+            }
         }
 
         Ok(Self {
@@ -512,6 +546,7 @@ impl settings::Settings for AllLanguageSettings {
             },
             defaults,
             languages,
+            file_types,
         })
     }
 
@@ -577,6 +612,10 @@ fn merge_settings(settings: &mut LanguageSettings, src: &LanguageSettingsContent
     merge(&mut settings.hard_tabs, src.hard_tabs);
     merge(&mut settings.soft_wrap, src.soft_wrap);
     merge(&mut settings.use_autoclose, src.use_autoclose);
+    merge(
+        &mut settings.always_treat_brackets_as_autoclosed,
+        src.always_treat_brackets_as_autoclosed,
+    );
     merge(&mut settings.show_wrap_guides, src.show_wrap_guides);
     merge(&mut settings.wrap_guides, src.wrap_guides.clone());
     merge(

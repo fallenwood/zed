@@ -1,10 +1,12 @@
 pub mod cursor_position;
 
+use cursor_position::LineIndicatorFormat;
 use editor::{scroll::Autoscroll, Editor};
 use gpui::{
     actions, div, prelude::*, AnyWindowHandle, AppContext, DismissEvent, EventEmitter, FocusHandle,
     FocusableView, Render, SharedString, Styled, Subscription, View, ViewContext, VisualContext,
 };
+use settings::Settings;
 use text::{Bias, Point};
 use theme::ActiveTheme;
 use ui::{h_flex, prelude::*, v_flex, Label};
@@ -14,6 +16,7 @@ use workspace::ModalView;
 actions!(go_to_line, [Toggle]);
 
 pub fn init(cx: &mut AppContext) {
+    LineIndicatorFormat::register(cx);
     cx.observe_new_views(GoToLine::register).detach();
 }
 
@@ -337,7 +340,7 @@ mod tests {
         workspace: &View<Workspace>,
         cx: &mut VisualTestContext,
     ) -> View<GoToLine> {
-        cx.dispatch_action(Toggle::default());
+        cx.dispatch_action(Toggle);
         workspace.update(cx, |workspace, cx| {
             workspace.active_modal::<GoToLine>(cx).unwrap().clone()
         })

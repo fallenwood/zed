@@ -1,13 +1,13 @@
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
-    overlay, point, prelude::FluentBuilder, px, rems, AnchorCorner, AnyElement, Bounds,
-    DismissEvent, DispatchPhase, Element, ElementContext, ElementId, HitboxId, IntoElement,
-    LayoutId, ManagedView, MouseDownEvent, ParentElement, Pixels, Point, View, VisualContext,
-    WindowContext,
+    anchored, deferred, div, point, prelude::FluentBuilder, px, AnchorCorner, AnyElement, Bounds,
+    DismissEvent, DispatchPhase, Element, ElementContext, ElementId, HitboxId, InteractiveElement,
+    IntoElement, LayoutId, ManagedView, MouseDownEvent, ParentElement, Pixels, Point, View,
+    VisualContext, WindowContext,
 };
 
-use crate::{Clickable, Selectable};
+use crate::prelude::*;
 
 pub trait PopoverTrigger: IntoElement + Clickable + Selectable + 'static {}
 
@@ -102,7 +102,7 @@ impl<M: ManagedView> PopoverMenu<M> {
     fn resolved_offset(&self, cx: &WindowContext) -> Point<Pixels> {
         self.offset.unwrap_or_else(|| {
             // Default offset = 4px padding + 1px border
-            let offset = rems(5. / 16.) * cx.rem_size();
+            let offset = rems_from_px(5.) * cx.rem_size();
             match self.anchor {
                 AnchorCorner::TopRight | AnchorCorner::BottomRight => point(offset, px(0.)),
                 AnchorCorner::TopLeft | AnchorCorner::BottomLeft => point(-offset, px(0.)),
@@ -176,15 +176,16 @@ impl<M: ManagedView> Element for PopoverMenu<M> {
             let mut menu_layout_id = None;
 
             let menu_element = element_state.menu.borrow_mut().as_mut().map(|menu| {
-                let mut overlay = overlay().snap_to_window().anchor(this.anchor);
-
+                let mut anchored = anchored().snap_to_window().anchor(this.anchor);
                 if let Some(child_bounds) = element_state.child_bounds {
-                    overlay = overlay.position(
+                    anchored = anchored.position(
                         this.resolved_attach().corner(child_bounds) + this.resolved_offset(cx),
                     );
                 }
+                let mut element = deferred(anchored.child(div().occlude().child(menu.clone())))
+                    .with_priority(1)
+                    .into_any();
 
-                let mut element = overlay.child(menu.clone()).into_any();
                 menu_layout_id = Some(element.before_layout(cx));
                 element
             });

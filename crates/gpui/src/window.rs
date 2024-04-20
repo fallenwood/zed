@@ -1,13 +1,14 @@
 use crate::{
-    px, transparent_black, Action, AnyDrag, AnyView, AppContext, Arena, AsyncWindowContext, Bounds,
-    Context, Corners, CursorStyle, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId,
-    Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, Flatten, Global, GlobalElementId,
-    Hsla, KeyBinding, KeyDownEvent, KeyMatch, KeymatchResult, Keystroke, KeystrokeEvent, Model,
-    ModelContext, Modifiers, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformWindow, Point, PromptLevel, Render, ScaledPixels,
-    SharedString, Size, SubscriberSet, Subscription, TaffyLayoutEngine, Task, TextStyle,
-    TextStyleRefinement, View, VisualContext, WeakView, WindowAppearance, WindowBounds,
-    WindowOptions, WindowTextSystem,
+    point, px, size, transparent_black, Action, AnyDrag, AnyView, AppContext, Arena,
+    AsyncWindowContext, Bounds, Context, Corners, CursorStyle, DevicePixels,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+    EntityId, EventEmitter, FileDropEvent, Flatten, Global, GlobalElementId, Hsla, KeyBinding,
+    KeyDownEvent, KeyMatch, KeymatchResult, Keystroke, KeystrokeEvent, Model, ModelContext,
+    Modifiers, ModifiersChangedEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformWindow, Point, PromptLevel, Render,
+    ScaledPixels, SharedString, Size, SubscriberSet, Subscription, TaffyLayoutEngine, Task,
+    TextStyle, TextStyleRefinement, View, VisualContext, WeakView, WindowAppearance,
+    WindowBackgroundAppearance, WindowOptions, WindowParams, WindowTextSystem,
 };
 use anyhow::{anyhow, Context as _, Result};
 use collections::FxHashSet;
@@ -29,7 +30,7 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicUsize, Ordering::SeqCst},
-        Arc,
+        Arc, Weak,
     },
     time::{Duration, Instant},
 };
@@ -155,6 +156,14 @@ impl FocusHandle {
         }
     }
 
+    /// Converts this focus handle into a weak variant, which does not prevent it from being released.
+    pub fn downgrade(&self) -> WeakFocusHandle {
+        WeakFocusHandle {
+            id: self.id,
+            handles: Arc::downgrade(&self.handles),
+        }
+    }
+
     /// Moves the focus to the element associated with this handle.
     pub fn focus(&self, cx: &mut WindowContext) {
         cx.focus(self)
@@ -207,6 +216,41 @@ impl Drop for FocusHandle {
     }
 }
 
+/// A weak reference to a focus handle.
+#[derive(Clone, Debug)]
+pub struct WeakFocusHandle {
+    pub(crate) id: FocusId,
+    handles: Weak<RwLock<SlotMap<FocusId, AtomicUsize>>>,
+}
+
+impl WeakFocusHandle {
+    /// Attempts to upgrade the [WeakFocusHandle] to a [FocusHandle].
+    pub fn upgrade(&self) -> Option<FocusHandle> {
+        let handles = self.handles.upgrade()?;
+        FocusHandle::for_id(self.id, &handles)
+    }
+}
+
+impl PartialEq for WeakFocusHandle {
+    fn eq(&self, other: &WeakFocusHandle) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for WeakFocusHandle {}
+
+impl PartialEq<FocusHandle> for WeakFocusHandle {
+    fn eq(&self, other: &FocusHandle) -> bool {
+        self.id == other.id
+    }
+}
+
+impl PartialEq<WeakFocusHandle> for FocusHandle {
+    fn eq(&self, other: &WeakFocusHandle) -> bool {
+        self.id == other.id
+    }
+}
+
 /// FocusableView allows users of your view to easily
 /// focus it (using cx.focus_view(view))
 pub trait FocusableView: 'static + Render {
@@ -243,6 +287,8 @@ pub struct Window {
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
     pub(crate) next_hitbox_id: HitboxId,
+    pub(crate) next_tooltip_id: TooltipId,
+    pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     pub(crate) focus_handles: Arc<RwLock<SlotMap<FocusId, AtomicUsize>>>,
@@ -253,7 +299,6 @@ pub struct Window {
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
     scale_factor: f32,
-    bounds: WindowBounds,
     bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -315,27 +360,80 @@ pub(crate) struct ElementStateBox {
     pub(crate) type_name: &'static str,
 }
 
+fn default_bounds(display_id: Option<DisplayId>, cx: &mut AppContext) -> Bounds<DevicePixels> {
+    const DEFAULT_WINDOW_SIZE: Size<DevicePixels> = size(DevicePixels(1024), DevicePixels(700));
+    const DEFAULT_WINDOW_OFFSET: Point<DevicePixels> = point(DevicePixels(0), DevicePixels(35));
+
+    cx.active_window()
+        .and_then(|w| w.update(cx, |_, cx| cx.window_bounds()).ok())
+        .map(|bounds| bounds.map_origin(|origin| origin + DEFAULT_WINDOW_OFFSET))
+        .unwrap_or_else(|| {
+            let display = display_id
+                .map(|id| cx.find_display(id))
+                .unwrap_or_else(|| cx.primary_display());
+
+            display
+                .map(|display| {
+                    let center = display.bounds().center();
+                    let offset = DEFAULT_WINDOW_SIZE / 2;
+                    let origin = point(center.x - offset.width, center.y - offset.height);
+                    Bounds::new(origin, DEFAULT_WINDOW_SIZE)
+                })
+                .unwrap_or_else(|| {
+                    Bounds::new(point(DevicePixels(0), DevicePixels(0)), DEFAULT_WINDOW_SIZE)
+                })
+        })
+}
+
 impl Window {
     pub(crate) fn new(
         handle: AnyWindowHandle,
         options: WindowOptions,
         cx: &mut AppContext,
     ) -> Self {
-        let platform_window = cx.platform.open_window(handle, options);
+        let WindowOptions {
+            bounds,
+            titlebar,
+            focus,
+            show,
+            kind,
+            is_movable,
+            display_id,
+            fullscreen,
+            window_background,
+        } = options;
+
+        let bounds = bounds.unwrap_or_else(|| default_bounds(display_id, cx));
+        let platform_window = cx.platform.open_window(
+            handle,
+            WindowParams {
+                bounds,
+                titlebar,
+                kind,
+                is_movable,
+                focus,
+                show,
+                display_id,
+                window_background,
+            },
+        );
         let display_id = platform_window.display().id();
         let sprite_atlas = platform_window.sprite_atlas();
         let mouse_position = platform_window.mouse_position();
         let modifiers = platform_window.modifiers();
         let content_size = platform_window.content_size();
         let scale_factor = platform_window.scale_factor();
-        let bounds = platform_window.bounds();
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let dirty = Rc::new(Cell::new(true));
-        let active = Rc::new(Cell::new(false));
+        let active = Rc::new(Cell::new(platform_window.is_active()));
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let last_input_timestamp = Rc::new(Cell::new(Instant::now()));
+
+        if fullscreen {
+            platform_window.toggle_fullscreen();
+        }
 
         platform_window.on_close(Box::new({
             let mut cx = cx.to_async();
@@ -380,6 +478,12 @@ impl Window {
                 } else if needs_present {
                     handle.update(&mut cx, |_, cx| cx.present()).log_err();
                 }
+
+                handle
+                    .update(&mut cx, |_, cx| {
+                        cx.complete_frame();
+                    })
+                    .log_err();
             }
         }));
         platform_window.on_resize(Box::new({
@@ -416,6 +520,7 @@ impl Window {
                             .activation_observers
                             .clone()
                             .retain(&(), |callback| callback(cx));
+                        cx.refresh();
                     })
                     .log_err();
             }
@@ -427,7 +532,7 @@ impl Window {
                 handle
                     .update(&mut cx, |_, cx| cx.dispatch_event(event))
                     .log_err()
-                    .unwrap_or(false)
+                    .unwrap_or(DispatchEventResult::default())
             })
         });
 
@@ -448,6 +553,8 @@ impl Window {
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
             next_hitbox_id: HitboxId::default(),
+            next_tooltip_id: TooltipId::default(),
+            tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
             focus_handles: Arc::new(RwLock::new(SlotMap::with_key())),
             focus_listeners: SubscriberSet::new(),
@@ -457,7 +564,6 @@ impl Window {
             mouse_hit_test: HitTest::default(),
             modifiers,
             scale_factor,
-            bounds,
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -480,6 +586,12 @@ impl Window {
     ) -> (Subscription, impl FnOnce()) {
         self.focus_listeners.insert((), value)
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DispatchEventResult {
+    pub propagate: bool,
+    pub default_prevented: bool,
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
@@ -530,6 +642,28 @@ impl<'a> WindowContext<'a> {
         if self.window.draw_phase == DrawPhase::None {
             self.window.refreshing = true;
             self.window.dirty.set(true);
+        }
+    }
+
+    /// Indicate that this view has changed, which will invoke any observers and also mark the window as dirty.
+    /// If this view or any of its ancestors are *cached*, notifying it will cause it or its ancestors to be redrawn.
+    pub fn notify(&mut self, view_id: EntityId) {
+        for view_id in self
+            .window
+            .rendered_frame
+            .dispatch_tree
+            .view_path(view_id)
+            .into_iter()
+            .rev()
+        {
+            if !self.window.dirty_views.insert(view_id) {
+                break;
+            }
+        }
+
+        if self.window.draw_phase == DrawPhase::None {
+            self.window.dirty.set(true);
+            self.app.push_effect(Effect::Notify { emitter: view_id });
         }
     }
 
@@ -595,13 +729,24 @@ impl<'a> WindowContext<'a> {
         style
     }
 
+    /// Check if the platform window is maximized
+    /// On some platforms (namely Windows) this is different than the bounds being the size of the display
+    pub fn is_maximized(&self) -> bool {
+        self.window.platform_window.is_maximized()
+    }
+
+    /// Check if the platform window is minimized
+    /// On some platforms (namely Windows) the position is incorrect when minimized
+    pub fn is_minimized(&self) -> bool {
+        self.window.platform_window.is_minimized()
+    }
+
     /// Dispatch the given action on the currently focused element.
     pub fn dispatch_action(&mut self, action: Box<dyn Action>) {
         let focus_handle = self.focused();
 
         let window = self.window.handle;
         self.app.defer(move |cx| {
-            cx.propagate_event = true;
             window
                 .update(cx, |_, cx| {
                     let node_id = focus_handle
@@ -616,9 +761,6 @@ impl<'a> WindowContext<'a> {
                     cx.dispatch_action_on_node(node_id, action.as_ref());
                 })
                 .log_err();
-            if cx.propagate_event {
-                cx.dispatch_global_action(action.as_ref());
-            }
         })
     }
 
@@ -725,22 +867,9 @@ impl<'a> WindowContext<'a> {
             .spawn(|app| f(AsyncWindowContext::new(app, self.window.handle)))
     }
 
-    /// Updates the global of the given type. The given closure is given simultaneous mutable
-    /// access both to the global and the context.
-    pub fn update_global<G, R>(&mut self, f: impl FnOnce(&mut G, &mut Self) -> R) -> R
-    where
-        G: Global,
-    {
-        let mut global = self.app.lease_global::<G>();
-        let result = f(&mut global, self);
-        self.app.end_global_lease(global);
-        result
-    }
-
     fn window_bounds_changed(&mut self) {
         self.window.scale_factor = self.window.platform_window.scale_factor();
         self.window.viewport_size = self.window.platform_window.content_size();
-        self.window.bounds = self.window.platform_window.bounds();
         self.window.display_id = self.window.platform_window.display().id();
         self.refresh();
 
@@ -751,8 +880,13 @@ impl<'a> WindowContext<'a> {
     }
 
     /// Returns the bounds of the current window in the global coordinate space, which could span across multiple displays.
-    pub fn window_bounds(&self) -> WindowBounds {
-        self.window.bounds
+    pub fn window_bounds(&self) -> Bounds<DevicePixels> {
+        self.window.platform_window.bounds()
+    }
+
+    /// Returns whether or not the window is currently fullscreen
+    pub fn is_fullscreen(&self) -> bool {
+        self.window.platform_window.is_fullscreen()
     }
 
     fn appearance_changed(&mut self) {
@@ -787,6 +921,13 @@ impl<'a> WindowContext<'a> {
     /// Updates the window's title at the platform level.
     pub fn set_window_title(&mut self, title: &str) {
         self.window.platform_window.set_title(title);
+    }
+
+    /// Sets the window background appearance.
+    pub fn set_background_appearance(&mut self, background_appearance: WindowBackgroundAppearance) {
+        self.window
+            .platform_window
+            .set_background_appearance(background_appearance);
     }
 
     /// Mark the window as dirty at the platform level.
@@ -873,6 +1014,10 @@ impl<'a> WindowContext<'a> {
         self.window.modifiers
     }
 
+    fn complete_frame(&self) {
+        self.window.platform_window.completed_frame();
+    }
+
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [Scene], use [present].
     #[profiling::function]
@@ -899,12 +1044,6 @@ impl<'a> WindowContext<'a> {
             );
         self.window.next_frame.focus = self.window.focus;
         self.window.next_frame.window_active = self.window.active.get();
-
-        // Set the cursor only if we're the active window.
-        if self.is_window_active() {
-            let cursor_style = self.compute_cursor_style().unwrap_or(CursorStyle::Arrow);
-            self.platform.set_cursor_style(cursor_style);
-        }
 
         // Register requested input handler with the platform window.
         if let Some(input_handler) = self.window.next_frame.input_handlers.pop() {
@@ -961,6 +1100,8 @@ impl<'a> WindowContext<'a> {
                 .clone()
                 .retain(&(), |listener| listener(&event, self));
         }
+
+        self.reset_cursor_style();
         self.window.refreshing = false;
         self.window.draw_phase = DrawPhase::None;
         self.window.needs_present.set(true);
@@ -975,26 +1116,31 @@ impl<'a> WindowContext<'a> {
         profiling::finish_frame!();
     }
 
-    fn compute_cursor_style(&mut self) -> Option<CursorStyle> {
-        // TODO: maybe we should have a HashMap keyed by HitboxId.
-        let request = self
-            .window
-            .next_frame
-            .cursor_styles
-            .iter()
-            .rev()
-            .find(|request| request.hitbox_id.is_hovered(self))?;
-        Some(request.style)
+    fn reset_cursor_style(&self) {
+        // Set the cursor only if we're the active window.
+        if self.is_window_active() {
+            let style = self
+                .window
+                .rendered_frame
+                .cursor_styles
+                .iter()
+                .rev()
+                .find(|request| request.hitbox_id.is_hovered(self))
+                .map(|request| request.style)
+                .unwrap_or(CursorStyle::Arrow);
+            self.platform.set_cursor_style(style);
+        }
     }
 
     /// Dispatch a given keystroke as though the user had typed it.
     /// You can create a keystroke with Keystroke::parse("").
     pub fn dispatch_keystroke(&mut self, keystroke: Keystroke) -> bool {
         let keystroke = keystroke.with_simulated_ime();
-        if self.dispatch_event(PlatformInput::KeyDown(KeyDownEvent {
+        let result = self.dispatch_event(PlatformInput::KeyDown(KeyDownEvent {
             keystroke: keystroke.clone(),
             is_held: false,
-        })) {
+        }));
+        if !result.propagate {
             return true;
         }
 
@@ -1027,7 +1173,7 @@ impl<'a> WindowContext<'a> {
 
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
-    pub fn dispatch_event(&mut self, event: PlatformInput) -> bool {
+    pub fn dispatch_event(&mut self, event: PlatformInput) -> DispatchEventResult {
         self.window.last_input_timestamp.set(Instant::now());
         // Handlers may set this to false by calling `stop_propagation`.
         self.app.propagate_event = true;
@@ -1101,12 +1247,10 @@ impl<'a> WindowContext<'a> {
                         click_count: 1,
                     })
                 }
-                FileDropEvent::Exited => PlatformInput::MouseUp(MouseUpEvent {
-                    button: MouseButton::Left,
-                    position: Point::default(),
-                    modifiers: Modifiers::default(),
-                    click_count: 1,
-                }),
+                FileDropEvent::Exited => {
+                    self.active_drag.take();
+                    PlatformInput::FileDrop(FileDropEvent::Exited)
+                }
             },
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
@@ -1117,11 +1261,18 @@ impl<'a> WindowContext<'a> {
             self.dispatch_key_event(any_key_event);
         }
 
-        !self.app.propagate_event
+        DispatchEventResult {
+            propagate: self.app.propagate_event,
+            default_prevented: self.window.default_prevented,
+        }
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any) {
-        self.window.mouse_hit_test = self.window.rendered_frame.hit_test(self.mouse_position());
+        let hit_test = self.window.rendered_frame.hit_test(self.mouse_position());
+        if hit_test != self.window.mouse_hit_test {
+            self.window.mouse_hit_test = hit_test;
+            self.reset_cursor_style();
+        }
 
         let mut mouse_listeners = mem::take(&mut self.window.rendered_frame.mouse_listeners);
         self.with_element_context(|cx| {
@@ -1148,7 +1299,7 @@ impl<'a> WindowContext<'a> {
         });
         self.window.rendered_frame.mouse_listeners = mouse_listeners;
 
-        if self.app.propagate_event && self.has_active_drag() {
+        if self.has_active_drag() {
             if event.is::<MouseMoveEvent>() {
                 // If this was a mouse move event, redraw the window so that the
                 // active drag can follow the mouse cursor.
@@ -1249,6 +1400,11 @@ impl<'a> WindowContext<'a> {
             return;
         }
 
+        self.dispatch_modifiers_changed_event(event, &dispatch_path);
+        if !self.propagate_event {
+            return;
+        }
+
         self.dispatch_keystroke_observers(event, None);
     }
 
@@ -1278,6 +1434,27 @@ impl<'a> WindowContext<'a> {
             for key_listener in node.key_listeners.clone() {
                 self.with_element_context(|cx| {
                     key_listener(event, DispatchPhase::Bubble, cx);
+                });
+                if !self.propagate_event {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn dispatch_modifiers_changed_event(
+        &mut self,
+        event: &dyn Any,
+        dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
+    ) {
+        let Some(event) = event.downcast_ref::<ModifiersChangedEvent>() else {
+            return;
+        };
+        for node_id in dispatch_path.iter().rev() {
+            let node = self.window.rendered_frame.dispatch_tree.node(*node_id);
+            for listener in node.modifiers_changed_listeners.clone() {
+                self.with_element_context(|cx| {
+                    listener(event, cx);
                 });
                 if !self.propagate_event {
                     return;
@@ -1353,7 +1530,34 @@ impl<'a> WindowContext<'a> {
             .dispatch_tree
             .dispatch_path(node_id);
 
-        // Capture phase
+        // Capture phase for global actions.
+        self.propagate_event = true;
+        if let Some(mut global_listeners) = self
+            .global_action_listeners
+            .remove(&action.as_any().type_id())
+        {
+            for listener in &global_listeners {
+                listener(action.as_any(), DispatchPhase::Capture, self);
+                if !self.propagate_event {
+                    break;
+                }
+            }
+
+            global_listeners.extend(
+                self.global_action_listeners
+                    .remove(&action.as_any().type_id())
+                    .unwrap_or_default(),
+            );
+
+            self.global_action_listeners
+                .insert(action.as_any().type_id(), global_listeners);
+        }
+
+        if !self.propagate_event {
+            return;
+        }
+
+        // Capture phase for window actions.
         for node_id in &dispatch_path {
             let node = self.window.rendered_frame.dispatch_tree.node(*node_id);
             for DispatchActionListener {
@@ -1373,7 +1577,8 @@ impl<'a> WindowContext<'a> {
                 }
             }
         }
-        // Bubble phase
+
+        // Bubble phase for window actions.
         for node_id in dispatch_path.iter().rev() {
             let node = self.window.rendered_frame.dispatch_tree.node(*node_id);
             for DispatchActionListener {
@@ -1394,6 +1599,30 @@ impl<'a> WindowContext<'a> {
                     }
                 }
             }
+        }
+
+        // Bubble phase for global actions.
+        if let Some(mut global_listeners) = self
+            .global_action_listeners
+            .remove(&action.as_any().type_id())
+        {
+            for listener in global_listeners.iter().rev() {
+                self.propagate_event = false; // Actions stop propagation by default during the bubble phase
+
+                listener(action.as_any(), DispatchPhase::Bubble, self);
+                if !self.propagate_event {
+                    break;
+                }
+            }
+
+            global_listeners.extend(
+                self.global_action_listeners
+                    .remove(&action.as_any().type_id())
+                    .unwrap_or_default(),
+            );
+
+            self.global_action_listeners
+                .insert(action.as_any().type_id(), global_listeners);
         }
     }
 
@@ -1423,8 +1652,8 @@ impl<'a> WindowContext<'a> {
     }
 
     /// Toggle full screen status on the current window at the platform level.
-    pub fn toggle_full_screen(&self) {
-        self.window.platform_window.toggle_full_screen();
+    pub fn toggle_fullscreen(&self) {
+        self.window.platform_window.toggle_fullscreen();
     }
 
     /// Present a platform dialog.
@@ -1585,6 +1814,14 @@ impl<'a> WindowContext<'a> {
     }
 }
 
+#[cfg(target_os = "windows")]
+impl WindowContext<'_> {
+    /// Returns the raw HWND handle for the window.
+    pub fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND {
+        self.window.platform_window.get_raw_handle()
+    }
+}
+
 impl Context for WindowContext<'_> {
     type Result<T> = T;
 
@@ -1595,6 +1832,18 @@ impl Context for WindowContext<'_> {
         let slot = self.app.entities.reserve();
         let model = build_model(&mut ModelContext::new(&mut *self.app, slot.downgrade()));
         self.entities.insert(slot, model)
+    }
+
+    fn reserve_model<T: 'static>(&mut self) -> Self::Result<crate::Reservation<T>> {
+        self.app.reserve_model()
+    }
+
+    fn insert_model<T: 'static>(
+        &mut self,
+        reservation: crate::Reservation<T>,
+        build_model: impl FnOnce(&mut ModelContext<'_, T>) -> T,
+    ) -> Self::Result<Model<T>> {
+        self.app.insert_model(reservation, build_model)
     }
 
     fn update_model<T: 'static, R>(
@@ -1611,18 +1860,6 @@ impl Context for WindowContext<'_> {
         result
     }
 
-    fn update_window<T, F>(&mut self, window: AnyWindowHandle, update: F) -> Result<T>
-    where
-        F: FnOnce(AnyView, &mut WindowContext<'_>) -> T,
-    {
-        if window == self.window.handle {
-            let root_view = self.window.root_view.clone().unwrap();
-            Ok(update(root_view, self))
-        } else {
-            window.update(self.app, update)
-        }
-    }
-
     fn read_model<T, R>(
         &self,
         handle: &Model<T>,
@@ -1633,6 +1870,18 @@ impl Context for WindowContext<'_> {
     {
         let entity = self.entities.read(handle);
         read(entity, &*self.app)
+    }
+
+    fn update_window<T, F>(&mut self, window: AnyWindowHandle, update: F) -> Result<T>
+    where
+        F: FnOnce(AnyView, &mut WindowContext<'_>) -> T,
+    {
+        if window == self.window.handle {
+            let root_view = self.window.root_view.clone().unwrap();
+            Ok(update(root_view, self))
+        } else {
+            window.update(self.app, update)
+        }
     }
 
     fn read_window<T, R>(
@@ -1989,25 +2238,7 @@ impl<'a, V: 'static> ViewContext<'a, V> {
     /// Indicate that this view has changed, which will invoke any observers and also mark the window as dirty.
     /// If this view or any of its ancestors are *cached*, notifying it will cause it or its ancestors to be redrawn.
     pub fn notify(&mut self) {
-        for view_id in self
-            .window
-            .rendered_frame
-            .dispatch_tree
-            .view_path(self.view.entity_id())
-            .into_iter()
-            .rev()
-        {
-            if !self.window.dirty_views.insert(view_id) {
-                break;
-            }
-        }
-
-        if self.window.draw_phase == DrawPhase::None {
-            self.window_cx.window.dirty.set(true);
-            self.window_cx.app.push_effect(Effect::Notify {
-                emitter: self.view.model.entity_id,
-            });
-        }
+        self.window_cx.notify(self.view.entity_id());
     }
 
     /// Register a callback to be invoked when the window is resized.
@@ -2181,17 +2412,6 @@ impl<'a, V: 'static> ViewContext<'a, V> {
         self.window_cx.spawn(|cx| f(view, cx))
     }
 
-    /// Updates the global state of the given type.
-    pub fn update_global<G, R>(&mut self, f: impl FnOnce(&mut G, &mut Self) -> R) -> R
-    where
-        G: Global,
-    {
-        let mut global = self.app.lease_global::<G>();
-        let result = f(&mut global, self);
-        self.app.end_global_lease(global);
-        result
-    }
-
     /// Register a callback to be invoked when the given global state changes.
     pub fn observe_global<G: Global>(
         &mut self,
@@ -2274,19 +2494,24 @@ impl<V> Context for ViewContext<'_, V> {
         self.window_cx.new_model(build_model)
     }
 
+    fn reserve_model<T: 'static>(&mut self) -> Self::Result<crate::Reservation<T>> {
+        self.window_cx.reserve_model()
+    }
+
+    fn insert_model<T: 'static>(
+        &mut self,
+        reservation: crate::Reservation<T>,
+        build_model: impl FnOnce(&mut ModelContext<'_, T>) -> T,
+    ) -> Self::Result<Model<T>> {
+        self.window_cx.insert_model(reservation, build_model)
+    }
+
     fn update_model<T: 'static, R>(
         &mut self,
         model: &Model<T>,
         update: impl FnOnce(&mut T, &mut ModelContext<'_, T>) -> R,
     ) -> R {
         self.window_cx.update_model(model, update)
-    }
-
-    fn update_window<T, F>(&mut self, window: AnyWindowHandle, update: F) -> Result<T>
-    where
-        F: FnOnce(AnyView, &mut WindowContext<'_>) -> T,
-    {
-        self.window_cx.update_window(window, update)
     }
 
     fn read_model<T, R>(
@@ -2298,6 +2523,13 @@ impl<V> Context for ViewContext<'_, V> {
         T: 'static,
     {
         self.window_cx.read_model(handle, read)
+    }
+
+    fn update_window<T, F>(&mut self, window: AnyWindowHandle, update: F) -> Result<T>
+    where
+        F: FnOnce(AnyView, &mut WindowContext<'_>) -> T,
+    {
+        self.window_cx.update_window(window, update)
     }
 
     fn read_window<T, R>(
@@ -2659,11 +2891,16 @@ impl From<(&'static str, u64)> for ElementId {
 /// Passed as an argument [`ElementContext::paint_quad`].
 #[derive(Clone)]
 pub struct PaintQuad {
-    bounds: Bounds<Pixels>,
-    corner_radii: Corners<Pixels>,
-    background: Hsla,
-    border_widths: Edges<Pixels>,
-    border_color: Hsla,
+    /// The bounds of the quad within the window.
+    pub bounds: Bounds<Pixels>,
+    /// The radii of the quad's corners.
+    pub corner_radii: Corners<Pixels>,
+    /// The background color of the quad.
+    pub background: Hsla,
+    /// The widths of the quad's borders.
+    pub border_widths: Edges<Pixels>,
+    /// The color of the quad's borders.
+    pub border_color: Hsla,
 }
 
 impl PaintQuad {

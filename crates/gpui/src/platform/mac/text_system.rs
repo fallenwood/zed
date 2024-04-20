@@ -219,23 +219,50 @@ impl MacTextSystemState {
         Ok(())
     }
 
-    fn load_family(
-        &mut self,
-        name: &SharedString,
-        features: FontFeatures,
-    ) -> Result<SmallVec<[FontId; 4]>> {
+    fn load_family(&mut self, name: &str, features: FontFeatures) -> Result<SmallVec<[FontId; 4]>> {
+        let name = if name == ".SystemUIFont" {
+            ".AppleSystemUIFont"
+        } else {
+            name
+        };
+
         let mut font_ids = SmallVec::new();
         let family = self
             .memory_source
-            .select_family_by_name(name.as_ref())
-            .or_else(|_| self.system_source.select_family_by_name(name.as_ref()))?;
+            .select_family_by_name(name)
+            .or_else(|_| self.system_source.select_family_by_name(name))?;
         for font in family.fonts() {
             let mut font = font.load()?;
 
             open_type::apply_features(&mut font, features);
-            let Some(_) = font.glyph_for_char('m') else {
-                continue;
-            };
+
+            // This block contains a precautionary fix to guard against loading fonts
+            // that might cause panics due to `.unwrap()`s up the chain.
+            {
+                // We use the 'm' character for text measurements in various spots
+                // (e.g., the editor). However, at time of writing some of those usages
+                // will panic if the font has no 'm' glyph.
+                //
+                // Therefore, we check up front that the font has the necessary glyph.
+                let has_m_glyph = font.glyph_for_char('m').is_some();
+
+                // HACK: The 'Segoe Fluent Icons' font does not have an 'm' glyph,
+                // but we need to be able to load it for rendering Windows icons in
+                // the Storybook (on macOS).
+                let is_segoe_fluent_icons = font.full_name() == "Segoe Fluent Icons";
+
+                if !has_m_glyph && !is_segoe_fluent_icons {
+                    // I spent far too long trying to track down why a font missing the 'm'
+                    // character wasn't loading. This log statement will hopefully save
+                    // someone else from suffering the same fate.
+                    log::warn!(
+                        "font '{}' has no 'm' character and was not loaded",
+                        font.full_name()
+                    );
+                    continue;
+                }
+            }
+
             // We've seen a number of panics in production caused by calling font.properties()
             // which unwraps a downcast to CFNumber. This is an attempt to avoid the panic,
             // and to try and identify the incalcitrant font.
@@ -307,7 +334,7 @@ impl MacTextSystemState {
         self.postscript_names_by_font_id
             .get(&font_id)
             .map_or(false, |postscript_name| {
-                postscript_name == "AppleColorEmoji"
+                postscript_name == "AppleColorEmoji" || postscript_name == ".AppleColorEmojiUI"
             })
     }
 

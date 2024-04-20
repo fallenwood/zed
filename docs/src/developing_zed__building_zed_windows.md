@@ -25,7 +25,7 @@ git submodule update --init --recursive
   rustup target add wasm32-wasi
   ```
 
-- Install [Visual Studio](https://visualstudio.microsoft.com/downloads/) with optional component `MSVC v*** - VS YYYY C++ x64/x86 build tools`. 
+- Install [Visual Studio](https://visualstudio.microsoft.com/downloads/) with optional component `MSVC v*** - VS YYYY C++ x64/x86 build tools` and install Windows 11 or 10 SDK depending on your system
 
 > [!NOTE]
 > `v***` is your VS version and `YYYY` is year when your VS was released.
@@ -37,7 +37,7 @@ git submodule update --init --recursive
 
 If you are developing collaborative features of Zed, you'll need to install the dependencies of zed's `collab` server:
 
-- Install [Postgres](https://www.postgresql.org/download/linux/)
+- Install [Postgres](https://www.postgresql.org/download/windows/)
 - Install [Livekit](https://github.com/livekit/livekit-cli) and [Foreman](https://theforeman.org/manuals/3.9/quickstart_guide.html)
 
 Alternatively, if you have [Docker](https://www.docker.com/) installed you can bring up all the `collab` dependencies using Docker Compose:

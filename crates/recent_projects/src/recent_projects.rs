@@ -56,7 +56,6 @@ impl RecentProjects {
                 .recent_workspaces_on_disk()
                 .await
                 .unwrap_or_default();
-
             this.update(&mut cx, move |this, cx| {
                 this.picker.update(cx, move |picker, cx| {
                     picker.delegate.workspaces = workspaces;
@@ -157,7 +156,7 @@ impl RecentProjectsDelegate {
     fn new(workspace: WeakView<Workspace>, create_new_window: bool, render_paths: bool) -> Self {
         Self {
             workspace,
-            workspaces: vec![],
+            workspaces: Vec::new(),
             selected_match_index: 0,
             matches: Default::default(),
             create_new_window,
@@ -259,7 +258,9 @@ impl PickerDelegate for RecentProjectsDelegate {
             };
             workspace
                 .update(cx, |workspace, cx| {
-                    if workspace.database_id() != *candidate_workspace_id {
+                    if workspace.database_id() == *candidate_workspace_id {
+                        Task::ready(Ok(()))
+                    } else {
                         let candidate_paths = candidate_workspace_location.paths().as_ref().clone();
                         if replace_current_window {
                             cx.spawn(move |workspace, mut cx| async move {
@@ -285,8 +286,6 @@ impl PickerDelegate for RecentProjectsDelegate {
                         } else {
                             workspace.open_workspace_for_paths(false, candidate_paths, cx)
                         }
-                    } else {
-                        Task::ready(Ok(()))
                     }
                 })
                 .detach_and_log_err(cx);
@@ -493,9 +492,16 @@ mod tests {
                 }),
             )
             .await;
-        cx.update(|cx| open_paths(&[PathBuf::from("/dir/main.ts")], app_state, None, cx))
-            .await
-            .unwrap();
+        cx.update(|cx| {
+            open_paths(
+                &[PathBuf::from("/dir/main.ts")],
+                app_state,
+                workspace::OpenOptions::default(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
         assert_eq!(cx.update(|cx| cx.windows().len()), 1);
 
         let workspace = cx.update(|cx| cx.windows()[0].downcast::<Workspace>().unwrap());
@@ -533,7 +539,10 @@ mod tests {
                         positions: Vec::new(),
                         string: "fake candidate".to_string(),
                     }];
-                    delegate.workspaces = vec![(0, WorkspaceLocation::new(vec!["/test/path/"]))];
+                    delegate.workspaces = vec![(
+                        WorkspaceId::default(),
+                        WorkspaceLocation::new(vec!["/test/path/"]),
+                    )];
                 });
             })
             .unwrap();

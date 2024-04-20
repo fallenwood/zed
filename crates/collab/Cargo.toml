@@ -13,10 +13,12 @@ workspace = true
 [[bin]]
 name = "collab"
 
-[[bin]]
-name = "seed"
+[features]
+sqlite = ["sea-orm/sqlx-sqlite", "sqlx/sqlite"]
+test-support = ["sqlite"]
 
 [dependencies]
+anthropic.workspace = true
 anyhow.workspace = true
 async-tungstenite = "0.16"
 aws-config = { version = "1.1.5" }
@@ -31,10 +33,12 @@ collections.workspace = true
 dashmap = "5.4"
 envy = "0.4.2"
 futures.workspace = true
+google_ai.workspace = true
 hex.workspace = true
 live_kit_server.workspace = true
 log.workspace = true
 nanoid = "0.4"
+open_ai.workspace = true
 parking_lot.workspace = true
 prometheus = "0.13"
 prost.workspace = true
@@ -43,6 +47,7 @@ reqwest = { version = "0.11", features = ["json"] }
 rpc.workspace = true
 scrypt = "0.7"
 sea-orm = { version = "0.12.x", features = ["sqlx-postgres", "postgres-array", "runtime-tokio-rustls", "with-uuid"] }
+semantic_version.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
@@ -54,12 +59,12 @@ rustc-demangle.workspace = true
 telemetry_events.workspace = true
 text.workspace = true
 time.workspace = true
-tokio = { version = "1", features = ["full"] }
+tokio.workspace = true
 toml.workspace = true
 tower = "0.4"
 tower-http = { workspace = true, features = ["trace"] }
-tracing = "0.1.34"
-tracing-subscriber = { version = "0.3.11", features = ["env-filter", "json", "registry", "tracing-log"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json", "registry", "tracing-log"] } # workaround for https://github.com/tokio-rs/tracing/issues/2927
 util.workspace = true
 uuid.workspace = true
 
@@ -80,7 +85,6 @@ git = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 indoc.workspace = true
 language = { workspace = true, features = ["test-support"] }
-lazy_static.workspace = true
 live_kit_client = { workspace = true, features = ["test-support"] }
 lsp = { workspace = true, features = ["test-support"] }
 menu.workspace = true
@@ -98,3 +102,4 @@ theme.workspace = true
 unindent.workspace = true
 util.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
+headless.workspace = true

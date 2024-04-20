@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
-use gpui::AppContext;
+use gpui::AsyncAppContext;
 use language::{LanguageServerName, LspAdapter, LspAdapterDelegate};
 use lsp::LanguageServerBinary;
 use node_runtime::NodeRuntime;
@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use util::{async_maybe, ResultExt};
+use util::{maybe, ResultExt};
 
 const SERVER_NAME: &str = "elm-language-server";
 const SERVER_PATH: &str = "node_modules/@elm-tooling/elm-language-server/out/node/index.js";
@@ -34,7 +34,7 @@ impl ElmLspAdapter {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl LspAdapter for ElmLspAdapter {
     fn name(&self) -> LanguageServerName {
         LanguageServerName(SERVER_NAME.into())
@@ -53,19 +53,22 @@ impl LspAdapter for ElmLspAdapter {
 
     async fn fetch_server_binary(
         &self,
-        version: Box<dyn 'static + Send + Any>,
+        latest_version: Box<dyn 'static + Send + Any>,
         container_dir: PathBuf,
         _: &dyn LspAdapterDelegate,
     ) -> Result<LanguageServerBinary> {
-        let version = version.downcast::<String>().unwrap();
+        let latest_version = latest_version.downcast::<String>().unwrap();
         let server_path = container_dir.join(SERVER_PATH);
+        let package_name = "@elm-tooling/elm-language-server";
 
-        if fs::metadata(&server_path).await.is_err() {
+        let should_install_language_server = self
+            .node
+            .should_install_npm_package(package_name, &server_path, &container_dir, &latest_version)
+            .await;
+
+        if should_install_language_server {
             self.node
-                .npm_install_packages(
-                    &container_dir,
-                    &[("@elm-tooling/elm-language-server", version.as_str())],
-                )
+                .npm_install_packages(&container_dir, &[(package_name, latest_version.as_str())])
                 .await?;
         }
 
@@ -91,16 +94,22 @@ impl LspAdapter for ElmLspAdapter {
         get_cached_server_binary(container_dir, &*self.node).await
     }
 
-    fn workspace_configuration(&self, _workspace_root: &Path, cx: &mut AppContext) -> Value {
+    async fn workspace_configuration(
+        self: Arc<Self>,
+        _: &Arc<dyn LspAdapterDelegate>,
+        cx: &mut AsyncAppContext,
+    ) -> Result<Value> {
         // elm-language-server expects workspace didChangeConfiguration notification
         // params to be the same as lsp initialization_options
-        let override_options = ProjectSettings::get_global(cx)
-            .lsp
-            .get(SERVER_NAME)
-            .and_then(|s| s.initialization_options.clone())
-            .unwrap_or_default();
+        let override_options = cx.update(|cx| {
+            ProjectSettings::get_global(cx)
+                .lsp
+                .get(SERVER_NAME)
+                .and_then(|s| s.initialization_options.clone())
+                .unwrap_or_default()
+        })?;
 
-        match override_options.clone().as_object_mut() {
+        Ok(match override_options.clone().as_object_mut() {
             Some(op) => {
                 // elm-language-server requests workspace configuration
                 // for the `elmLS` section, so we have to nest
@@ -109,7 +118,7 @@ impl LspAdapter for ElmLspAdapter {
                 serde_json::to_value(op).unwrap_or_default()
             }
             None => override_options,
-        }
+        })
     }
 }
 
@@ -117,7 +126,7 @@ async fn get_cached_server_binary(
     container_dir: PathBuf,
     node: &dyn NodeRuntime,
 ) -> Option<LanguageServerBinary> {
-    async_maybe!({
+    maybe!(async {
         let mut last_version_dir = None;
         let mut entries = fs::read_dir(&container_dir).await?;
         while let Some(entry) = entries.next().await {

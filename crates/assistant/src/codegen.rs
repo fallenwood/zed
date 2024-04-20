@@ -1,12 +1,13 @@
-use crate::streaming_diff::{Hunk, StreamingDiff};
-use ai::completion::{CompletionProvider, CompletionRequest};
+use crate::{
+    streaming_diff::{Hunk, StreamingDiff},
+    CompletionProvider, LanguageModelRequest,
+};
 use anyhow::Result;
 use editor::{Anchor, MultiBuffer, MultiBufferSnapshot, ToOffset, ToPoint};
 use futures::{channel::mpsc, SinkExt, Stream, StreamExt};
 use gpui::{EventEmitter, Model, ModelContext, Task};
 use language::{Rope, TransactionId};
-use multi_buffer;
-use std::{cmp, future, ops::Range, sync::Arc};
+use std::{cmp, future, ops::Range};
 
 pub enum Event {
     Finished,
@@ -20,7 +21,6 @@ pub enum CodegenKind {
 }
 
 pub struct Codegen {
-    provider: Arc<dyn CompletionProvider>,
     buffer: Model<MultiBuffer>,
     snapshot: MultiBufferSnapshot,
     kind: CodegenKind,
@@ -35,15 +35,9 @@ pub struct Codegen {
 impl EventEmitter<Event> for Codegen {}
 
 impl Codegen {
-    pub fn new(
-        buffer: Model<MultiBuffer>,
-        kind: CodegenKind,
-        provider: Arc<dyn CompletionProvider>,
-        cx: &mut ModelContext<Self>,
-    ) -> Self {
+    pub fn new(buffer: Model<MultiBuffer>, kind: CodegenKind, cx: &mut ModelContext<Self>) -> Self {
         let snapshot = buffer.read(cx).snapshot(cx);
         Self {
-            provider,
             buffer: buffer.clone(),
             snapshot,
             kind,
@@ -94,7 +88,7 @@ impl Codegen {
         self.error.as_ref()
     }
 
-    pub fn start(&mut self, prompt: Box<dyn CompletionRequest>, cx: &mut ModelContext<Self>) {
+    pub fn start(&mut self, prompt: LanguageModelRequest, cx: &mut ModelContext<Self>) {
         let range = self.range();
         let snapshot = self.snapshot.clone();
         let selected_text = snapshot
@@ -108,7 +102,7 @@ impl Codegen {
             .next()
             .unwrap_or_else(|| snapshot.indent_size_for_line(selection_start.row));
 
-        let response = self.provider.complete(prompt);
+        let response = CompletionProvider::global(cx).complete(prompt);
         self.generation = cx.spawn(|this, mut cx| {
             async move {
                 let generate = async {
@@ -305,7 +299,7 @@ fn strip_invalid_spans_from_codeblock(
         }
 
         if first_line {
-            if buffer == "" || buffer == "`" || buffer == "``" {
+            if buffer.is_empty() || buffer == "`" || buffer == "``" {
                 return future::ready(None);
             } else if buffer.starts_with("```") {
                 starts_with_markdown_codeblock = true;
@@ -360,14 +354,15 @@ fn strip_invalid_spans_from_codeblock(
 mod tests {
     use std::sync::Arc;
 
+    use crate::FakeCompletionProvider;
+
     use super::*;
-    use ai::test::FakeCompletionProvider;
     use futures::stream::{self};
     use gpui::{Context, TestAppContext};
     use indoc::indoc;
     use language::{
-        language_settings, tree_sitter_rust, Buffer, BufferId, Language, LanguageConfig,
-        LanguageMatcher, Point,
+        language_settings, tree_sitter_rust, Buffer, Language, LanguageConfig, LanguageMatcher,
+        Point,
     };
     use rand::prelude::*;
     use serde::Serialize;
@@ -378,15 +373,11 @@ mod tests {
         pub name: String,
     }
 
-    impl CompletionRequest for DummyCompletionRequest {
-        fn data(&self) -> serde_json::Result<String> {
-            serde_json::to_string(self)
-        }
-    }
-
     #[gpui::test(iterations = 10)]
     async fn test_transform_autoindent(cx: &mut TestAppContext, mut rng: StdRng) {
+        let provider = FakeCompletionProvider::default();
         cx.set_global(cx.update(SettingsStore::test));
+        cx.set_global(CompletionProvider::Fake(provider.clone()));
         cx.update(language_settings::init);
 
         let text = indoc! {"
@@ -397,27 +388,17 @@ mod tests {
                 }
             }
         "};
-        let buffer = cx.new_model(|cx| {
-            Buffer::new(0, BufferId::new(1).unwrap(), text).with_language(Arc::new(rust_lang()), cx)
-        });
+        let buffer =
+            cx.new_model(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
         let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
         let range = buffer.read_with(cx, |buffer, cx| {
             let snapshot = buffer.snapshot(cx);
             snapshot.anchor_before(Point::new(1, 0))..snapshot.anchor_after(Point::new(4, 5))
         });
-        let provider = Arc::new(FakeCompletionProvider::new());
-        let codegen = cx.new_model(|cx| {
-            Codegen::new(
-                buffer.clone(),
-                CodegenKind::Transform { range },
-                provider.clone(),
-                cx,
-            )
-        });
+        let codegen =
+            cx.new_model(|cx| Codegen::new(buffer.clone(), CodegenKind::Transform { range }, cx));
 
-        let request = Box::new(DummyCompletionRequest {
-            name: "test".to_string(),
-        });
+        let request = LanguageModelRequest::default();
         codegen.update(cx, |codegen, cx| codegen.start(request, cx));
 
         let mut new_text = concat!(
@@ -430,8 +411,7 @@ mod tests {
             let max_len = cmp::min(new_text.len(), 10);
             let len = rng.gen_range(1..=max_len);
             let (chunk, suffix) = new_text.split_at(len);
-            println!("CHUNK: {:?}", &chunk);
-            provider.send_completion(chunk);
+            provider.send_completion(chunk.into());
             new_text = suffix;
             cx.background_executor.run_until_parked();
         }
@@ -456,6 +436,8 @@ mod tests {
         cx: &mut TestAppContext,
         mut rng: StdRng,
     ) {
+        let provider = FakeCompletionProvider::default();
+        cx.set_global(CompletionProvider::Fake(provider.clone()));
         cx.set_global(cx.update(SettingsStore::test));
         cx.update(language_settings::init);
 
@@ -464,27 +446,17 @@ mod tests {
                 le
             }
         "};
-        let buffer = cx.new_model(|cx| {
-            Buffer::new(0, BufferId::new(1).unwrap(), text).with_language(Arc::new(rust_lang()), cx)
-        });
+        let buffer =
+            cx.new_model(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
         let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
         let position = buffer.read_with(cx, |buffer, cx| {
             let snapshot = buffer.snapshot(cx);
             snapshot.anchor_before(Point::new(1, 6))
         });
-        let provider = Arc::new(FakeCompletionProvider::new());
-        let codegen = cx.new_model(|cx| {
-            Codegen::new(
-                buffer.clone(),
-                CodegenKind::Generate { position },
-                provider.clone(),
-                cx,
-            )
-        });
+        let codegen =
+            cx.new_model(|cx| Codegen::new(buffer.clone(), CodegenKind::Generate { position }, cx));
 
-        let request = Box::new(DummyCompletionRequest {
-            name: "test".to_string(),
-        });
+        let request = LanguageModelRequest::default();
         codegen.update(cx, |codegen, cx| codegen.start(request, cx));
 
         let mut new_text = concat!(
@@ -497,7 +469,7 @@ mod tests {
             let max_len = cmp::min(new_text.len(), 10);
             let len = rng.gen_range(1..=max_len);
             let (chunk, suffix) = new_text.split_at(len);
-            provider.send_completion(chunk);
+            provider.send_completion(chunk.into());
             new_text = suffix;
             cx.background_executor.run_until_parked();
         }
@@ -522,6 +494,8 @@ mod tests {
         cx: &mut TestAppContext,
         mut rng: StdRng,
     ) {
+        let provider = FakeCompletionProvider::default();
+        cx.set_global(CompletionProvider::Fake(provider.clone()));
         cx.set_global(cx.update(SettingsStore::test));
         cx.update(language_settings::init);
 
@@ -530,27 +504,17 @@ mod tests {
             "  \n",
             "}\n" //
         );
-        let buffer = cx.new_model(|cx| {
-            Buffer::new(0, BufferId::new(1).unwrap(), text).with_language(Arc::new(rust_lang()), cx)
-        });
+        let buffer =
+            cx.new_model(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
         let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
         let position = buffer.read_with(cx, |buffer, cx| {
             let snapshot = buffer.snapshot(cx);
             snapshot.anchor_before(Point::new(1, 2))
         });
-        let provider = Arc::new(FakeCompletionProvider::new());
-        let codegen = cx.new_model(|cx| {
-            Codegen::new(
-                buffer.clone(),
-                CodegenKind::Generate { position },
-                provider.clone(),
-                cx,
-            )
-        });
+        let codegen =
+            cx.new_model(|cx| Codegen::new(buffer.clone(), CodegenKind::Generate { position }, cx));
 
-        let request = Box::new(DummyCompletionRequest {
-            name: "test".to_string(),
-        });
+        let request = LanguageModelRequest::default();
         codegen.update(cx, |codegen, cx| codegen.start(request, cx));
 
         let mut new_text = concat!(
@@ -563,8 +527,7 @@ mod tests {
             let max_len = cmp::min(new_text.len(), 10);
             let len = rng.gen_range(1..=max_len);
             let (chunk, suffix) = new_text.split_at(len);
-            println!("{:?}", &chunk);
-            provider.send_completion(chunk);
+            provider.send_completion(chunk.into());
             new_text = suffix;
             cx.background_executor.run_until_parked();
         }

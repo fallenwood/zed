@@ -1,17 +1,19 @@
 use std::{fmt::Display, ops::Range, sync::Arc};
 
+use crate::surrounds::SurroundsType;
+use crate::{motion::Motion, object::Object};
 use collections::HashMap;
+use editor::Anchor;
 use gpui::{Action, KeyContext};
-use language::CursorShape;
+use language::{CursorShape, Selection, TransactionId};
 use serde::{Deserialize, Serialize};
 use workspace::searchable::Direction;
-
-use crate::motion::Motion;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Mode {
     Normal,
     Insert,
+    Replace,
     Visual,
     VisualLine,
     VisualBlock,
@@ -22,6 +24,7 @@ impl Display for Mode {
         match self {
             Mode::Normal => write!(f, "NORMAL"),
             Mode::Insert => write!(f, "INSERT"),
+            Mode::Replace => write!(f, "REPLACE"),
             Mode::Visual => write!(f, "VISUAL"),
             Mode::VisualLine => write!(f, "VISUAL LINE"),
             Mode::VisualBlock => write!(f, "VISUAL BLOCK"),
@@ -32,7 +35,7 @@ impl Display for Mode {
 impl Mode {
     pub fn is_visual(&self) -> bool {
         match self {
-            Mode::Normal | Mode::Insert => false,
+            Mode::Normal | Mode::Insert | Mode::Replace => false,
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => true,
         }
     }
@@ -44,7 +47,7 @@ impl Default for Mode {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub enum Operator {
     Change,
     Delete,
@@ -53,6 +56,9 @@ pub enum Operator {
     Object { around: bool },
     FindForward { before: bool },
     FindBackward { after: bool },
+    AddSurrounds { target: Option<SurroundsType> },
+    ChangeSurrounds { target: Option<Object> },
+    DeleteSurrounds,
 }
 
 #[derive(Default, Clone)]
@@ -66,6 +72,11 @@ pub struct EditorState {
     pub post_count: Option<usize>,
 
     pub operator_stack: Vec<Operator>,
+    pub replacements: Vec<(Range<editor::Anchor>, String)>,
+
+    pub current_tx: Option<TransactionId>,
+    pub current_anchor: Option<Selection<Anchor>>,
+    pub undo_modes: HashMap<TransactionId, Mode>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -127,21 +138,15 @@ impl Clone for ReplayableAction {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default, Debug)]
 pub struct SearchState {
     pub direction: Direction,
     pub count: usize,
     pub initial_query: String,
-}
 
-impl Default for SearchState {
-    fn default() -> Self {
-        Self {
-            direction: Direction::Next,
-            count: 1,
-            initial_query: "".to_string(),
-        }
-    }
+    pub prior_selections: Vec<Range<Anchor>>,
+    pub prior_operator: Option<Operator>,
+    pub prior_mode: Mode,
 }
 
 impl EditorState {
@@ -154,17 +159,21 @@ impl EditorState {
                     CursorShape::Underscore
                 }
             }
+            Mode::Replace => CursorShape::Underscore,
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => CursorShape::Block,
             Mode::Insert => CursorShape::Bar,
         }
     }
 
     pub fn vim_controlled(&self) -> bool {
-        !matches!(self.mode, Mode::Insert)
-            || matches!(
-                self.operator_stack.last(),
-                Some(Operator::FindForward { .. }) | Some(Operator::FindBackward { .. })
-            )
+        let is_insert_mode = matches!(self.mode, Mode::Insert);
+        if !is_insert_mode {
+            return true;
+        }
+        matches!(
+            self.operator_stack.last(),
+            Some(Operator::FindForward { .. }) | Some(Operator::FindBackward { .. })
+        )
     }
 
     pub fn should_autoindent(&self) -> bool {
@@ -173,13 +182,15 @@ impl EditorState {
 
     pub fn clip_at_line_ends(&self) -> bool {
         match self.mode {
-            Mode::Insert | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => false,
+            Mode::Insert | Mode::Visual | Mode::VisualLine | Mode::VisualBlock | Mode::Replace => {
+                false
+            }
             Mode::Normal => true,
         }
     }
 
     pub fn active_operator(&self) -> Option<Operator> {
-        self.operator_stack.last().copied()
+        self.operator_stack.last().cloned()
     }
 
     pub fn keymap_context_layer(&self) -> KeyContext {
@@ -190,6 +201,7 @@ impl EditorState {
                 Mode::Normal => "normal",
                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock => "visual",
                 Mode::Insert => "insert",
+                Mode::Replace => "replace",
             },
         );
 
@@ -205,7 +217,7 @@ impl EditorState {
 
         let active_operator = self.active_operator();
 
-        if let Some(active_operator) = active_operator {
+        if let Some(active_operator) = active_operator.clone() {
             for context_flag in active_operator.context_flags().into_iter() {
                 context.add(*context_flag);
             }
@@ -213,9 +225,15 @@ impl EditorState {
 
         context.set(
             "vim_operator",
-            active_operator.map(|op| op.id()).unwrap_or_else(|| "none"),
+            active_operator
+                .clone()
+                .map(|op| op.id())
+                .unwrap_or_else(|| "none"),
         );
 
+        if self.mode == Mode::Replace {
+            context.add("VimWaiting");
+        }
         context
     }
 }
@@ -233,15 +251,21 @@ impl Operator {
             Operator::FindForward { before: true } => "t",
             Operator::FindBackward { after: false } => "F",
             Operator::FindBackward { after: true } => "T",
+            Operator::AddSurrounds { .. } => "ys",
+            Operator::ChangeSurrounds { .. } => "cs",
+            Operator::DeleteSurrounds => "ds",
         }
     }
 
     pub fn context_flags(&self) -> &'static [&'static str] {
         match self {
-            Operator::Object { .. } => &["VimObject"],
-            Operator::FindForward { .. } | Operator::FindBackward { .. } | Operator::Replace => {
-                &["VimWaiting"]
-            }
+            Operator::Object { .. } | Operator::ChangeSurrounds { target: None } => &["VimObject"],
+            Operator::FindForward { .. }
+            | Operator::FindBackward { .. }
+            | Operator::Replace
+            | Operator::AddSurrounds { target: Some(_) }
+            | Operator::ChangeSurrounds { .. }
+            | Operator::DeleteSurrounds => &["VimWaiting"],
             _ => &[],
         }
     }

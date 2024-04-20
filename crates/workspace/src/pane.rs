@@ -1,23 +1,27 @@
 use crate::{
-    item::{ClosePosition, Item, ItemHandle, ItemSettings, WeakItemHandle},
+    item::{
+        ClosePosition, Item, ItemHandle, ItemSettings, PreviewTabsSettings, TabContentParams,
+        WeakItemHandle,
+    },
     toolbar::Toolbar,
-    workspace_settings::{AutosaveSetting, WorkspaceSettings},
-    NewCenterTerminal, NewFile, NewSearch, OpenVisible, SplitDirection, ToggleZoom, Workspace,
+    workspace_settings::{AutosaveSetting, TabBarSettings, WorkspaceSettings},
+    CloseWindow, NewCenterTerminal, NewFile, NewSearch, OpenInTerminal, OpenTerminal, OpenVisible,
+    SplitDirection, ToggleZoom, Workspace,
 };
 use anyhow::Result;
 use collections::{HashMap, HashSet, VecDeque};
 use futures::{stream::FuturesUnordered, StreamExt};
 use gpui::{
-    actions, impl_actions, overlay, prelude::*, Action, AnchorCorner, AnyElement, AppContext,
-    AsyncWindowContext, ClickEvent, DismissEvent, Div, DragMoveEvent, EntityId, EventEmitter,
-    ExternalPaths, FocusHandle, FocusableView, Model, MouseButton, NavigationDirection, Pixels,
-    Point, PromptLevel, Render, ScrollHandle, Subscription, Task, View, ViewContext, VisualContext,
-    WeakView, WindowContext,
+    actions, anchored, deferred, impl_actions, prelude::*, Action, AnchorCorner, AnyElement,
+    AppContext, AsyncWindowContext, ClickEvent, DismissEvent, Div, DragMoveEvent, EntityId,
+    EventEmitter, ExternalPaths, FocusHandle, FocusableView, KeyContext, Model, MouseButton,
+    MouseDownEvent, NavigationDirection, Pixels, Point, PromptLevel, Render, ScrollHandle,
+    Subscription, Task, View, ViewContext, VisualContext, WeakFocusHandle, WeakView, WindowContext,
 };
 use parking_lot::Mutex;
 use project::{Project, ProjectEntryId, ProjectPath};
 use serde::Deserialize;
-use settings::Settings;
+use settings::{Settings, SettingsStore};
 use std::{
     any::Any,
     cmp, fmt, mem,
@@ -86,6 +90,12 @@ pub struct RevealInProjectPanel {
     pub entry_id: Option<u64>,
 }
 
+#[derive(PartialEq, Clone, Deserialize)]
+pub struct DeploySearch {
+    #[serde(default)]
+    pub replace_enabled: bool,
+}
+
 impl_actions!(
     pane,
     [
@@ -93,7 +103,8 @@ impl_actions!(
         CloseActiveItem,
         CloseInactiveItems,
         ActivateItem,
-        RevealInProjectPanel
+        RevealInProjectPanel,
+        DeploySearch,
     ]
 );
 
@@ -107,15 +118,23 @@ actions!(
         CloseItemsToTheLeft,
         CloseItemsToTheRight,
         GoBack,
-        DeploySearch,
         GoForward,
         ReopenClosedItem,
         SplitLeft,
         SplitUp,
         SplitRight,
         SplitDown,
+        TogglePreviewTab,
     ]
 );
+
+impl DeploySearch {
+    pub fn find() -> Self {
+        Self {
+            replace_enabled: false,
+        }
+    }
+}
 
 const MAX_NAVIGATION_HISTORY_LEN: usize = 1024;
 
@@ -159,6 +178,10 @@ impl fmt::Debug for Event {
     }
 }
 
+/// A container for 0 to many items that are open in the workspace.
+/// Treats all items uniformly via the [`ItemHandle`] trait, whether it's an editor, search results multibuffer, terminal or something else,
+/// responsible for managing item tabs, focus and zoom states and drag and drop features.
+/// Can be split, see `PaneGroup` for more details.
 pub struct Pane {
     focus_handle: FocusHandle,
     items: Vec<Box<dyn ItemHandle>>,
@@ -166,13 +189,14 @@ pub struct Pane {
     zoomed: bool,
     was_focused: bool,
     active_item_index: usize,
-    last_focused_view_by_item: HashMap<EntityId, FocusHandle>,
+    preview_item_id: Option<EntityId>,
+    last_focus_handle_by_item: HashMap<EntityId, WeakFocusHandle>,
     nav_history: NavHistory,
     toolbar: View<Toolbar>,
     new_item_menu: Option<View<ContextMenu>>,
     split_item_menu: Option<View<ContextMenu>>,
     //     tab_context_menu: View<ContextMenu>,
-    workspace: WeakView<Workspace>,
+    pub(crate) workspace: WeakView<Workspace>,
     project: Model<Project>,
     drag_split_direction: Option<SplitDirection>,
     can_drop_predicate: Option<Arc<dyn Fn(&dyn Any, &mut WindowContext) -> bool>>,
@@ -183,11 +207,13 @@ pub struct Pane {
     _subscriptions: Vec<Subscription>,
     tab_bar_scroll_handle: ScrollHandle,
     display_nav_history_buttons: bool,
+    double_click_dispatch_action: Box<dyn Action>,
 }
 
 pub struct ItemNavHistory {
     history: NavHistory,
     item: Arc<dyn WeakItemHandle>,
+    is_preview: bool,
 }
 
 #[derive(Clone)]
@@ -223,6 +249,7 @@ pub struct NavigationEntry {
     pub item: Arc<dyn WeakItemHandle>,
     pub data: Option<Box<dyn Any + Send>>,
     pub timestamp: usize,
+    pub is_preview: bool,
 }
 
 #[derive(Clone)]
@@ -242,6 +269,7 @@ impl Pane {
         project: Model<Project>,
         next_timestamp: Arc<AtomicUsize>,
         can_drop_predicate: Option<Arc<dyn Fn(&dyn Any, &mut WindowContext) -> bool + 'static>>,
+        double_click_dispatch_action: Box<dyn Action>,
         cx: &mut ViewContext<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
@@ -250,6 +278,7 @@ impl Pane {
             cx.on_focus(&focus_handle, Pane::focus_in),
             cx.on_focus_in(&focus_handle, Pane::focus_in),
             cx.on_focus_out(&focus_handle, Pane::focus_out),
+            cx.observe_global::<SettingsStore>(Self::settings_changed),
         ];
 
         let handle = cx.view().downgrade();
@@ -260,7 +289,8 @@ impl Pane {
             was_focused: false,
             zoomed: false,
             active_item_index: 0,
-            last_focused_view_by_item: Default::default(),
+            preview_item_id: None,
+            last_focus_handle_by_item: Default::default(),
             nav_history: NavHistory(Arc::new(Mutex::new(NavHistoryState {
                 mode: NavigationMode::Normal,
                 backward_stack: Default::default(),
@@ -336,7 +366,11 @@ impl Pane {
                                 pane.toggle_zoom(&crate::ToggleZoom, cx);
                             }))
                             .tooltip(move |cx| {
-                                Tooltip::text(if zoomed { "Zoom Out" } else { "Zoom In" }, cx)
+                                Tooltip::for_action(
+                                    if zoomed { "Zoom Out" } else { "Zoom In" },
+                                    &ToggleZoom,
+                                    cx,
+                                )
                             })
                     })
                     .when_some(pane.split_item_menu.as_ref(), |el, split_item_menu| {
@@ -344,8 +378,9 @@ impl Pane {
                     })
                     .into_any_element()
             }),
-            display_nav_history_buttons: true,
+            display_nav_history_buttons: TabBarSettings::get_global(cx).show_nav_history_buttons,
             _subscriptions: subscriptions,
+            double_click_dispatch_action,
         }
     }
 
@@ -377,18 +412,20 @@ impl Pane {
             if self.focus_handle.is_focused(cx) {
                 // Pane was focused directly. We need to either focus a view inside the active item,
                 // or focus the active item itself
-                if let Some(weak_last_focused_view) =
-                    self.last_focused_view_by_item.get(&active_item.item_id())
+                if let Some(weak_last_focus_handle) =
+                    self.last_focus_handle_by_item.get(&active_item.item_id())
                 {
-                    weak_last_focused_view.focus(cx);
-                    return;
+                    if let Some(focus_handle) = weak_last_focus_handle.upgrade() {
+                        focus_handle.focus(cx);
+                        return;
+                    }
                 }
 
                 active_item.focus_handle(cx).focus(cx);
             } else if let Some(focused) = cx.focused() {
                 if !self.context_menu_focused(cx) {
-                    self.last_focused_view_by_item
-                        .insert(active_item.item_id(), focused);
+                    self.last_focus_handle_by_item
+                        .insert(active_item.item_id(), focused.downgrade());
                 }
             }
         }
@@ -409,8 +446,21 @@ impl Pane {
         cx.notify();
     }
 
+    fn settings_changed(&mut self, cx: &mut ViewContext<Self>) {
+        self.display_nav_history_buttons = TabBarSettings::get_global(cx).show_nav_history_buttons;
+
+        if !PreviewTabsSettings::get_global(cx).enabled {
+            self.preview_item_id = None;
+        }
+        cx.notify();
+    }
+
     pub fn active_item_index(&self) -> usize {
         self.active_item_index
+    }
+
+    pub fn activation_history(&self) -> &Vec<EntityId> {
+        &self.activation_history
     }
 
     pub fn set_can_split(&mut self, can_split: bool, cx: &mut ViewContext<Self>) {
@@ -445,6 +495,7 @@ impl Pane {
         ItemNavHistory {
             history: self.nav_history.clone(),
             item: Arc::new(item.downgrade()),
+            is_preview: self.preview_item_id == Some(item.item_id()),
         }
     }
 
@@ -498,10 +549,45 @@ impl Pane {
         self.toolbar.update(cx, |_, cx| cx.notify());
     }
 
+    pub fn preview_item_id(&self) -> Option<EntityId> {
+        self.preview_item_id
+    }
+
+    fn preview_item_idx(&self) -> Option<usize> {
+        if let Some(preview_item_id) = self.preview_item_id {
+            self.items
+                .iter()
+                .position(|item| item.item_id() == preview_item_id)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_active_preview_item(&self, item_id: EntityId) -> bool {
+        self.preview_item_id == Some(item_id)
+    }
+
+    /// Marks the item with the given ID as the preview item.
+    /// This will be ignored if the global setting `preview_tabs` is disabled.
+    pub fn set_preview_item_id(&mut self, item_id: Option<EntityId>, cx: &AppContext) {
+        if PreviewTabsSettings::get_global(cx).enabled {
+            self.preview_item_id = item_id;
+        }
+    }
+
+    pub fn handle_item_edit(&mut self, item_id: EntityId, cx: &AppContext) {
+        if let Some(preview_item_id) = self.preview_item_id {
+            if preview_item_id == item_id {
+                self.set_preview_item_id(None, cx)
+            }
+        }
+    }
+
     pub(crate) fn open_item(
         &mut self,
         project_entry_id: Option<ProjectEntryId>,
         focus_item: bool,
+        allow_preview: bool,
         cx: &mut ViewContext<Self>,
         build_item: impl FnOnce(&mut ViewContext<Pane>) -> Box<dyn ItemHandle>,
     ) -> Box<dyn ItemHandle> {
@@ -519,11 +605,43 @@ impl Pane {
         }
 
         if let Some((index, existing_item)) = existing_item {
+            // If the item is already open, and the item is a preview item
+            // and we are not allowing items to open as preview, mark the item as persistent.
+            if let Some(preview_item_id) = self.preview_item_id {
+                if let Some(tab) = self.items.get(index) {
+                    if tab.item_id() == preview_item_id && !allow_preview {
+                        self.set_preview_item_id(None, cx);
+                    }
+                }
+            }
+
             self.activate_item(index, focus_item, focus_item, cx);
             existing_item
         } else {
+            let mut destination_index = None;
+            if allow_preview {
+                // If we are opening a new item as preview and we have an existing preview tab, remove it.
+                if let Some(item_idx) = self.preview_item_idx() {
+                    let prev_active_item_index = self.active_item_index;
+                    self.remove_item(item_idx, false, false, cx);
+                    self.active_item_index = prev_active_item_index;
+
+                    // If the item is being opened as preview and we have an existing preview tab,
+                    // open the new item in the position of the existing preview tab.
+                    if item_idx < self.items.len() {
+                        destination_index = Some(item_idx);
+                    }
+                }
+            }
+
             let new_item = build_item(cx);
-            self.add_item(new_item.clone(), true, focus_item, None, cx);
+
+            if allow_preview {
+                self.set_preview_item_id(Some(new_item.item_id()), cx);
+            }
+
+            self.add_item(new_item.clone(), true, focus_item, destination_index, cx);
+
             new_item
         }
     }
@@ -615,7 +733,10 @@ impl Pane {
             self.activate_item(insertion_index, activate_pane, focus_item, cx);
         } else {
             self.items.insert(insertion_index, item.clone());
-            if insertion_index <= self.active_item_index {
+
+            if insertion_index <= self.active_item_index
+                && self.preview_item_idx() != Some(self.active_item_index)
+            {
                 self.active_item_index += 1;
             }
 
@@ -702,11 +823,10 @@ impl Pane {
                 if let Some(prev_item) = self.items.get(prev_active_item_ix) {
                     prev_item.deactivated(cx);
                 }
-
-                cx.emit(Event::ActivateItem {
-                    local: activate_pane,
-                });
             }
+            cx.emit(Event::ActivateItem {
+                local: activate_pane,
+            });
 
             if let Some(newly_active_item) = self.items.get(index) {
                 self.activation_history
@@ -754,6 +874,8 @@ impl Pane {
         cx: &mut ViewContext<Self>,
     ) -> Option<Task<Result<()>>> {
         if self.items.is_empty() {
+            // Close the window when there's no active items to close.
+            cx.dispatch_action(Box::new(CloseWindow));
             return None;
         }
         let active_item_id = self.items[self.active_item_index].item_id();
@@ -1010,7 +1132,7 @@ impl Pane {
                         .iter()
                         .position(|i| i.item_id() == item.item_id())
                     {
-                        pane.remove_item(item_ix, false, cx);
+                        pane.remove_item(item_ix, false, true, cx);
                     }
                 })
                 .ok();
@@ -1025,6 +1147,7 @@ impl Pane {
         &mut self,
         item_index: usize,
         activate_pane: bool,
+        close_pane_if_empty: bool,
         cx: &mut ViewContext<Self>,
     ) {
         self.activation_history
@@ -1058,17 +1181,24 @@ impl Pane {
         });
         if self.items.is_empty() {
             item.deactivated(cx);
-            self.update_toolbar(cx);
-            cx.emit(Event::Remove);
+            if close_pane_if_empty {
+                self.update_toolbar(cx);
+                cx.emit(Event::Remove);
+            }
         }
 
         if item_index < self.active_item_index {
             self.active_item_index -= 1;
         }
 
+        let mode = self.nav_history.mode();
         self.nav_history.set_mode(NavigationMode::ClosingItem);
         item.deactivated(cx);
-        self.nav_history.set_mode(NavigationMode::Normal);
+        self.nav_history.set_mode(mode);
+
+        if self.is_active_preview_item(item.item_id()) {
+            self.set_preview_item_id(None, cx);
+        }
 
         if let Some(path) = item.project_path(cx) {
             let abs_path = self
@@ -1092,7 +1222,7 @@ impl Pane {
                 .remove(&item.item_id());
         }
 
-        if self.items.is_empty() && self.zoomed {
+        if self.items.is_empty() && close_pane_if_empty && self.zoomed {
             cx.emit(Event::ZoomOut);
         }
 
@@ -1257,7 +1387,7 @@ impl Pane {
             }
         })?;
 
-        self.remove_item(item_index_to_delete, false, cx);
+        self.remove_item(item_index_to_delete, false, true, cx);
         self.nav_history.remove_item(item_id);
 
         Some(())
@@ -1297,20 +1427,21 @@ impl Pane {
         cx: &mut ViewContext<'_, Pane>,
     ) -> impl IntoElement {
         let is_active = ix == self.active_item_index;
+        let is_preview = self
+            .preview_item_id
+            .map(|id| id == item.item_id())
+            .unwrap_or(false);
 
-        let label = item.tab_content(Some(detail), is_active, cx);
+        let label = item.tab_content(
+            TabContentParams {
+                detail: Some(detail),
+                selected: is_active,
+                preview: is_preview,
+            },
+            cx,
+        );
         let close_side = &ItemSettings::get_global(cx).close_position;
-
-        let indicator = maybe!({
-            let indicator_color = match (item.has_conflict(cx), item.is_dirty(cx)) {
-                (true, _) => Color::Warning,
-                (_, true) => Color::Accent,
-                (false, false) => return None,
-            };
-
-            Some(Indicator::dot().color(indicator_color))
-        });
-
+        let indicator = render_item_indicator(item.boxed_clone(), cx);
         let item_id = item.item_id();
         let is_first_item = ix == 0;
         let is_last_item = ix == self.items.len() - 1;
@@ -1338,6 +1469,16 @@ impl Pane {
                 cx.listener(move |pane, _event, cx| {
                     pane.close_item_by_id(item_id, SaveIntent::Close, cx)
                         .detach_and_log_err(cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |pane, event: &MouseDownEvent, cx| {
+                    if let Some(id) = pane.preview_item_id {
+                        if id == item_id && event.click_count > 1 {
+                            pane.set_preview_item_id(None, cx);
+                        }
+                    }
                 }),
             )
             .on_drag(
@@ -1459,20 +1600,58 @@ impl Pane {
                         );
 
                     if let Some(entry) = single_entry_to_resolve {
+                        let parent_abs_path = pane
+                            .update(cx, |pane, cx| {
+                                pane.workspace.update(cx, |workspace, cx| {
+                                    let project = workspace.project().read(cx);
+                                    project.worktree_for_entry(entry, cx).and_then(|worktree| {
+                                        let worktree = worktree.read(cx);
+                                        let entry = worktree.entry_for_id(entry)?;
+                                        let abs_path = worktree.absolutize(&entry.path).ok()?;
+                                        let parent = if entry.is_symlink {
+                                            abs_path.canonicalize().ok()?
+                                        } else {
+                                            abs_path
+                                        }
+                                        .parent()?
+                                        .to_path_buf();
+                                        Some(parent)
+                                    })
+                                })
+                            })
+                            .ok()
+                            .flatten();
+
                         let entry_id = entry.to_proto();
-                        menu = menu.separator().entry(
-                            "Reveal In Project Panel",
-                            Some(Box::new(RevealInProjectPanel {
-                                entry_id: Some(entry_id),
-                            })),
-                            cx.handler_for(&pane, move |pane, cx| {
-                                pane.project.update(cx, |_, cx| {
-                                    cx.emit(project::Event::RevealInProjectPanel(
-                                        ProjectEntryId::from_proto(entry_id),
-                                    ))
-                                });
-                            }),
-                        );
+                        menu = menu
+                            .separator()
+                            .entry(
+                                "Reveal In Project Panel",
+                                Some(Box::new(RevealInProjectPanel {
+                                    entry_id: Some(entry_id),
+                                })),
+                                cx.handler_for(&pane, move |pane, cx| {
+                                    pane.project.update(cx, |_, cx| {
+                                        cx.emit(project::Event::RevealInProjectPanel(
+                                            ProjectEntryId::from_proto(entry_id),
+                                        ))
+                                    });
+                                }),
+                            )
+                            .when_some(parent_abs_path, |menu, abs_path| {
+                                menu.entry(
+                                    "Open in Terminal",
+                                    Some(Box::new(OpenInTerminal)),
+                                    cx.handler_for(&pane, move |_, cx| {
+                                        cx.dispatch_action(
+                                            OpenTerminal {
+                                                working_directory: abs_path.clone(),
+                                            }
+                                            .boxed_clone(),
+                                        );
+                                    }),
+                                )
+                            });
                     }
                 }
 
@@ -1520,7 +1699,7 @@ impl Pane {
                 self.items
                     .iter()
                     .enumerate()
-                    .zip(self.tab_details(cx))
+                    .zip(tab_details(&self.items, cx))
                     .map(|((ix, item), detail)| self.render_tab(ix, item, detail, cx)),
             )
             .child(
@@ -1550,58 +1729,23 @@ impl Pane {
                         this.drag_split_direction = None;
                         this.handle_external_paths_drop(paths, cx)
                     }))
-                    .on_click(cx.listener(move |_, event: &ClickEvent, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, cx| {
                         if event.up.click_count == 2 {
-                            cx.dispatch_action(NewFile.boxed_clone());
+                            cx.dispatch_action(this.double_click_dispatch_action.boxed_clone())
                         }
                     })),
             )
     }
 
     fn render_menu_overlay(menu: &View<ContextMenu>) -> Div {
-        div()
-            .absolute()
-            .bottom_0()
-            .right_0()
-            .size_0()
-            .child(overlay().anchor(AnchorCorner::TopRight).child(menu.clone()))
-    }
-
-    fn tab_details(&self, cx: &AppContext) -> Vec<usize> {
-        let mut tab_details = self.items.iter().map(|_| 0).collect::<Vec<_>>();
-
-        let mut tab_descriptions = HashMap::default();
-        let mut done = false;
-        while !done {
-            done = true;
-
-            // Store item indices by their tab description.
-            for (ix, (item, detail)) in self.items.iter().zip(&tab_details).enumerate() {
-                if let Some(description) = item.tab_description(*detail, cx) {
-                    if *detail == 0
-                        || Some(&description) != item.tab_description(detail - 1, cx).as_ref()
-                    {
-                        tab_descriptions
-                            .entry(description)
-                            .or_insert(Vec::new())
-                            .push(ix);
-                    }
-                }
-            }
-
-            // If two or more items have the same tab description, increase eir level
-            // of detail and try again.
-            for (_, item_ixs) in tab_descriptions.drain() {
-                if item_ixs.len() > 1 {
-                    done = false;
-                    for ix in item_ixs {
-                        tab_details[ix] += 1;
-                    }
-                }
-            }
-        }
-
-        tab_details
+        div().absolute().bottom_0().right_0().size_0().child(
+            deferred(
+                anchored()
+                    .anchor(AnchorCorner::TopRight)
+                    .child(menu.clone()),
+            )
+            .with_priority(1),
+        )
     }
 
     pub fn set_zoomed(&mut self, zoomed: bool, cx: &mut ViewContext<Self>) {
@@ -1618,16 +1762,35 @@ impl Pane {
             return;
         }
 
-        let edge_width = cx.rem_size() * 8;
-        let cursor = event.event.position;
-        let direction = if cursor.x < event.bounds.left() + edge_width {
-            Some(SplitDirection::Left)
-        } else if cursor.x > event.bounds.right() - edge_width {
-            Some(SplitDirection::Right)
-        } else if cursor.y < event.bounds.top() + edge_width {
-            Some(SplitDirection::Up)
-        } else if cursor.y > event.bounds.bottom() - edge_width {
-            Some(SplitDirection::Down)
+        let rect = event.bounds.size;
+
+        let size = event.bounds.size.width.min(event.bounds.size.height)
+            * WorkspaceSettings::get_global(cx).drop_target_size;
+
+        let relative_cursor = Point::new(
+            event.event.position.x - event.bounds.left(),
+            event.event.position.y - event.bounds.top(),
+        );
+
+        let direction = if relative_cursor.x < size
+            || relative_cursor.x > rect.width - size
+            || relative_cursor.y < size
+            || relative_cursor.y > rect.height - size
+        {
+            [
+                SplitDirection::Up,
+                SplitDirection::Right,
+                SplitDirection::Down,
+                SplitDirection::Left,
+            ]
+            .iter()
+            .min_by_key(|side| match side {
+                SplitDirection::Up => relative_cursor.y,
+                SplitDirection::Right => rect.width - relative_cursor.x,
+                SplitDirection::Down => rect.height - relative_cursor.y,
+                SplitDirection::Left => relative_cursor.x,
+            })
+            .cloned()
         } else {
             None
         };
@@ -1651,6 +1814,12 @@ impl Pane {
         let mut to_pane = cx.view().clone();
         let split_direction = self.drag_split_direction;
         let item_id = dragged_tab.item.item_id();
+        if let Some(preview_item_id) = self.preview_item_id {
+            if item_id == preview_item_id {
+                self.set_preview_item_id(None, cx);
+            }
+        }
+
         let from_pane = dragged_tab.pane.clone();
         self.workspace
             .update(cx, |_, cx| {
@@ -1765,8 +1934,14 @@ impl FocusableView for Pane {
 
 impl Render for Pane {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+        let mut key_context = KeyContext::default();
+        key_context.add("Pane");
+        if self.active_item().is_none() {
+            key_context.add("EmptyPane");
+        }
+
         v_flex()
-            .key_context("Pane")
+            .key_context(key_context)
             .track_focus(&self.focus_handle)
             .size_full()
             .flex_none()
@@ -1792,6 +1967,17 @@ impl Render for Pane {
             .on_action(cx.listener(|pane: &mut Pane, _: &ActivateNextItem, cx| {
                 pane.activate_next_item(true, cx);
             }))
+            .when(PreviewTabsSettings::get_global(cx).enabled, |this| {
+                this.on_action(cx.listener(|pane: &mut Pane, _: &TogglePreviewTab, cx| {
+                    if let Some(active_item_id) = pane.active_item().map(|i| i.item_id()) {
+                        if pane.is_active_preview_item(active_item_id) {
+                            pane.set_preview_item_id(None, cx);
+                        } else {
+                            pane.set_preview_item_id(Some(active_item_id), cx);
+                        }
+                    }
+                }))
+            })
             .on_action(
                 cx.listener(|pane: &mut Self, action: &CloseActiveItem, cx| {
                     if let Some(task) = pane.close_active_item(action, cx) {
@@ -1887,10 +2073,7 @@ impl Render for Pane {
                         div()
                             .invisible()
                             .absolute()
-                            .bg(theme::color_alpha(
-                                cx.theme().colors().drop_target_background,
-                                0.75,
-                            ))
+                            .bg(cx.theme().colors().drop_target_background)
                             .group_drag_over::<DraggedTab>("", |style| style.visible())
                             .group_drag_over::<ProjectEntryId>("", |style| style.visible())
                             .group_drag_over::<ExternalPaths>("", |style| style.visible())
@@ -1906,17 +2089,22 @@ impl Render for Pane {
                             .on_drop(cx.listener(move |this, paths, cx| {
                                 this.handle_external_paths_drop(paths, cx)
                             }))
-                            .map(|div| match self.drag_split_direction {
-                                None => div.top_0().left_0().right_0().bottom_0(),
-                                Some(SplitDirection::Up) => div.top_0().left_0().right_0().h_32(),
-                                Some(SplitDirection::Down) => {
-                                    div.left_0().bottom_0().right_0().h_32()
-                                }
-                                Some(SplitDirection::Left) => {
-                                    div.top_0().left_0().bottom_0().w_32()
-                                }
-                                Some(SplitDirection::Right) => {
-                                    div.top_0().bottom_0().right_0().w_32()
+                            .map(|div| {
+                                let size = DefiniteLength::Fraction(0.5);
+                                match self.drag_split_direction {
+                                    None => div.top_0().right_0().bottom_0().left_0(),
+                                    Some(SplitDirection::Up) => {
+                                        div.top_0().left_0().right_0().h(size)
+                                    }
+                                    Some(SplitDirection::Down) => {
+                                        div.left_0().bottom_0().right_0().h(size)
+                                    }
+                                    Some(SplitDirection::Left) => {
+                                        div.top_0().left_0().bottom_0().w(size)
+                                    }
+                                    Some(SplitDirection::Right) => {
+                                        div.top_0().bottom_0().right_0().w(size)
+                                    }
                                 }
                             }),
                     )
@@ -1952,7 +2140,8 @@ impl Render for Pane {
 
 impl ItemNavHistory {
     pub fn push<D: 'static + Send + Any>(&mut self, data: Option<D>, cx: &mut WindowContext) {
-        self.history.push(data, self.item.clone(), cx);
+        self.history
+            .push(data, self.item.clone(), self.is_preview, cx);
     }
 
     pub fn pop_backward(&mut self, cx: &mut WindowContext) -> Option<NavigationEntry> {
@@ -2026,6 +2215,7 @@ impl NavHistory {
         &mut self,
         data: Option<D>,
         item: Arc<dyn WeakItemHandle>,
+        is_preview: bool,
         cx: &mut WindowContext,
     ) {
         let state = &mut *self.0.lock();
@@ -2039,6 +2229,7 @@ impl NavHistory {
                     item,
                     data: data.map(|data| Box::new(data) as Box<dyn Any + Send>),
                     timestamp: state.next_timestamp.fetch_add(1, Ordering::SeqCst),
+                    is_preview,
                 });
                 state.forward_stack.clear();
             }
@@ -2050,6 +2241,7 @@ impl NavHistory {
                     item,
                     data: data.map(|data| Box::new(data) as Box<dyn Any + Send>),
                     timestamp: state.next_timestamp.fetch_add(1, Ordering::SeqCst),
+                    is_preview,
                 });
             }
             NavigationMode::GoingForward => {
@@ -2060,6 +2252,7 @@ impl NavHistory {
                     item,
                     data: data.map(|data| Box::new(data) as Box<dyn Any + Send>),
                     timestamp: state.next_timestamp.fetch_add(1, Ordering::SeqCst),
+                    is_preview,
                 });
             }
             NavigationMode::ClosingItem => {
@@ -2070,6 +2263,7 @@ impl NavHistory {
                     item,
                     data: data.map(|data| Box::new(data) as Box<dyn Any + Send>),
                     timestamp: state.next_timestamp.fetch_add(1, Ordering::SeqCst),
+                    is_preview,
                 });
             }
         }
@@ -2108,10 +2302,62 @@ impl NavHistoryState {
 fn dirty_message_for(buffer_path: Option<ProjectPath>) -> String {
     let path = buffer_path
         .as_ref()
-        .and_then(|p| p.path.to_str())
+        .and_then(|p| {
+            p.path
+                .to_str()
+                .and_then(|s| if s == "" { None } else { Some(s) })
+        })
         .unwrap_or("This buffer");
     let path = truncate_and_remove_front(path, 80);
     format!("{path} contains unsaved edits. Do you want to save it?")
+}
+
+pub fn tab_details(items: &Vec<Box<dyn ItemHandle>>, cx: &AppContext) -> Vec<usize> {
+    let mut tab_details = items.iter().map(|_| 0).collect::<Vec<_>>();
+    let mut tab_descriptions = HashMap::default();
+    let mut done = false;
+    while !done {
+        done = true;
+
+        // Store item indices by their tab description.
+        for (ix, (item, detail)) in items.iter().zip(&tab_details).enumerate() {
+            if let Some(description) = item.tab_description(*detail, cx) {
+                if *detail == 0
+                    || Some(&description) != item.tab_description(detail - 1, cx).as_ref()
+                {
+                    tab_descriptions
+                        .entry(description)
+                        .or_insert(Vec::new())
+                        .push(ix);
+                }
+            }
+        }
+
+        // If two or more items have the same tab description, increase their level
+        // of detail and try again.
+        for (_, item_ixs) in tab_descriptions.drain() {
+            if item_ixs.len() > 1 {
+                done = false;
+                for ix in item_ixs {
+                    tab_details[ix] += 1;
+                }
+            }
+        }
+    }
+
+    tab_details
+}
+
+pub fn render_item_indicator(item: Box<dyn ItemHandle>, cx: &WindowContext) -> Option<Indicator> {
+    maybe!({
+        let indicator_color = match (item.has_conflict(cx), item.is_dirty(cx)) {
+            (true, _) => Color::Warning,
+            (_, true) => Color::Accent,
+            (false, false) => return None,
+        };
+
+        Some(Indicator::dot().color(indicator_color))
+    })
 }
 
 #[cfg(test)]
@@ -2660,7 +2906,14 @@ mod tests {
 impl Render for DraggedTab {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let ui_font = ThemeSettings::get_global(cx).ui_font.family.clone();
-        let label = self.item.tab_content(Some(self.detail), false, cx);
+        let label = self.item.tab_content(
+            TabContentParams {
+                detail: Some(self.detail),
+                selected: false,
+                preview: false,
+            },
+            cx,
+        );
         Tab::new("")
             .selected(self.is_active)
             .child(label)

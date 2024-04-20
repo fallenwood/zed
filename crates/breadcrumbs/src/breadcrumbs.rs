@@ -4,10 +4,11 @@ use gpui::{
     ViewContext,
 };
 use itertools::Itertools;
+use std::cmp;
 use theme::ActiveTheme;
 use ui::{prelude::*, ButtonLike, ButtonStyle, Label, Tooltip};
 use workspace::{
-    item::{ItemEvent, ItemHandle},
+    item::{BreadcrumbText, ItemEvent, ItemHandle},
     ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
 };
 
@@ -31,19 +32,42 @@ impl EventEmitter<ToolbarItemEvent> for Breadcrumbs {}
 
 impl Render for Breadcrumbs {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+        const MAX_SEGMENTS: usize = 12;
         let element = h_flex().text_ui();
         let Some(active_item) = self.active_item.as_ref() else {
             return element;
         };
-        let Some(segments) = active_item.breadcrumbs(cx.theme(), cx) else {
+        let Some(mut segments) = active_item.breadcrumbs(cx.theme(), cx) else {
             return element;
         };
 
+        let prefix_end_ix = cmp::min(segments.len(), MAX_SEGMENTS / 2);
+        let suffix_start_ix = cmp::max(
+            prefix_end_ix,
+            segments.len().saturating_sub(MAX_SEGMENTS / 2),
+        );
+        if suffix_start_ix > prefix_end_ix {
+            segments.splice(
+                prefix_end_ix..suffix_start_ix,
+                Some(BreadcrumbText {
+                    text: "⋯".into(),
+                    highlights: None,
+                    font: None,
+                }),
+            );
+        }
+
         let highlighted_segments = segments.into_iter().map(|segment| {
             let mut text_style = cx.text_style();
+            if let Some(font) = segment.font {
+                text_style.font_family = font.family;
+                text_style.font_features = font.features;
+                text_style.font_style = font.style;
+                text_style.font_weight = font.weight;
+            }
             text_style.color = Color::Muted.color(cx);
 
-            StyledText::new(segment.text)
+            StyledText::new(segment.text.replace('\n', "␤"))
                 .with_highlights(&text_style, segment.highlights.unwrap_or_default())
                 .into_any()
         });
@@ -69,7 +93,7 @@ impl Render for Breadcrumbs {
             ),
             None => element
                 // Match the height of the `ButtonLike` in the other arm.
-                .h(rems(22. / 16.))
+                .h(rems_from_px(22.))
                 .child(breadcrumbs_stack),
         }
     }

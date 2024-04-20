@@ -1,7 +1,7 @@
 syntax = "proto3";
 package zed.messages;
 
-// Looking for a number? Search "// Current max"
+// Looking for a number? Search "// current max"
 
 message PeerId {
     uint32 owner_id = 1;
@@ -26,6 +26,7 @@ message Envelope {
         Error error = 6;
         Ping ping = 7;
         Test test = 8;
+        EndStream end_stream = 165;
 
         CreateRoom create_room = 9;
         CreateRoomResponse create_room_response = 10;
@@ -198,6 +199,40 @@ message Envelope {
         GetImplementationResponse get_implementation_response = 163;
 
         JoinHostedProject join_hosted_project = 164;
+
+        CompleteWithLanguageModel complete_with_language_model = 166;
+        LanguageModelResponse language_model_response = 167;
+        CountTokensWithLanguageModel count_tokens_with_language_model = 168;
+        CountTokensResponse count_tokens_response = 169;
+        GetCachedEmbeddings get_cached_embeddings = 189;
+        GetCachedEmbeddingsResponse get_cached_embeddings_response = 190;
+        ComputeEmbeddings compute_embeddings = 191;
+        ComputeEmbeddingsResponse compute_embeddings_response = 192; // current max
+
+        UpdateChannelMessage update_channel_message = 170;
+        ChannelMessageUpdate channel_message_update = 171;
+
+        BlameBuffer blame_buffer = 172;
+        BlameBufferResponse blame_buffer_response = 173;
+
+        UpdateNotification update_notification = 174;
+
+        MultiLspQuery multi_lsp_query = 175;
+        MultiLspQueryResponse multi_lsp_query_response = 176;
+
+        CreateRemoteProject create_remote_project = 177;
+        CreateRemoteProjectResponse create_remote_project_response = 188;
+        CreateDevServer create_dev_server = 178;
+        CreateDevServerResponse create_dev_server_response = 179;
+        ShutdownDevServer shutdown_dev_server = 180;
+        DevServerInstructions dev_server_instructions = 181;
+        ReconnectDevServer reconnect_dev_server = 182;
+        ReconnectDevServerResponse reconnect_dev_server_response = 183;
+
+        ShareRemoteProject share_remote_project = 184;
+        JoinRemoteProject join_remote_project = 185;
+        RejoinRemoteProjects rejoin_remote_projects = 186;
+        RejoinRemoteProjectsResponse rejoin_remote_projects_response = 187;
     }
 
     reserved 158 to 161;
@@ -233,8 +268,11 @@ enum ErrorCode {
     WrongMoveTarget = 11;
     UnsharedItem = 12;
     NoSuchProject = 13;
+    DevServerAlreadyOnline = 14;
     reserved 6;
 }
+
+message EndStream {}
 
 message Test {
     uint64 id = 1;
@@ -261,6 +299,13 @@ message RejoinRoom {
     uint64 id = 1;
     repeated UpdateProject reshared_projects = 2;
     repeated RejoinProject rejoined_projects = 3;
+}
+message RejoinRemoteProjects {
+    repeated RejoinProject rejoined_projects = 1;
+}
+
+message RejoinRemoteProjectsResponse {
+    repeated RejoinedProject rejoined_projects = 1;
 }
 
 message RejoinProject {
@@ -409,6 +454,52 @@ message JoinProject {
 
 message JoinHostedProject {
     uint64 project_id = 1;
+}
+
+message CreateRemoteProject {
+    uint64 channel_id = 1;
+    string name = 2;
+    uint64 dev_server_id = 3;
+    string path = 4;
+}
+message CreateRemoteProjectResponse {
+    RemoteProject remote_project = 1;
+}
+
+message CreateDevServer {
+    uint64 channel_id = 1;
+    string name = 2;
+}
+
+message CreateDevServerResponse {
+    uint64 dev_server_id = 1;
+    uint64 channel_id = 2;
+    string access_token = 3;
+    string name = 4;
+}
+
+message ShutdownDevServer {
+}
+
+message ReconnectDevServer {
+    repeated UpdateProject reshared_projects = 1;
+}
+
+message ReconnectDevServerResponse {
+    repeated ResharedProject reshared_projects = 1;
+}
+
+message DevServerInstructions {
+    repeated RemoteProject projects = 1;
+}
+
+message ShareRemoteProject {
+    uint64 remote_project_id = 1;
+    repeated WorktreeMetadata worktrees = 2;
+}
+
+message JoinRemoteProject {
+    uint64 remote_project_id = 1;
 }
 
 message JoinProjectResponse {
@@ -664,7 +755,7 @@ message BufferSaved {
     uint64 buffer_id = 2;
     repeated VectorClockEntry version = 3;
     Timestamp mtime = 4;
-    string fingerprint = 5;
+    reserved 5;
 }
 
 message BufferReloaded {
@@ -672,7 +763,7 @@ message BufferReloaded {
     uint64 buffer_id = 2;
     repeated VectorClockEntry version = 3;
     Timestamp mtime = 4;
-    string fingerprint = 5;
+    reserved 5;
     LineEnding line_ending = 6;
 }
 
@@ -947,6 +1038,7 @@ message SearchProject {
 
 message SearchProjectResponse {
     repeated Location locations = 1;
+    bool limit_reached = 2;
 }
 
 message CodeAction {
@@ -1038,6 +1130,12 @@ message UpdateChannels {
 
     repeated HostedProject hosted_projects = 10;
     repeated uint64 deleted_hosted_projects = 11;
+
+    repeated DevServer dev_servers = 12;
+    repeated uint64 deleted_dev_servers = 13;
+
+    repeated RemoteProject remote_projects = 14;
+    repeated uint64 deleted_remote_projects = 15;
 }
 
 message UpdateUserChannels {
@@ -1071,6 +1169,27 @@ message HostedProject {
     uint64 channel_id = 2;
     string name = 3;
     ChannelVisibility visibility = 4;
+}
+
+message RemoteProject {
+    uint64 id = 1;
+    optional uint64 project_id = 2;
+    uint64 channel_id = 3;
+    string name = 4;
+    uint64 dev_server_id = 5;
+    string path = 6;
+}
+
+message DevServer {
+    uint64 channel_id = 1;
+    uint64 dev_server_id = 2;
+    string name = 3;
+    DevServerStatus status = 4;
+}
+
+enum DevServerStatus {
+    Offline = 0;
+    Online = 1;
 }
 
 message JoinChannel {
@@ -1175,6 +1294,14 @@ message RemoveChannelMessage {
     uint64 message_id = 2;
 }
 
+message UpdateChannelMessage {
+    uint64 channel_id = 1;
+    uint64 message_id = 2;
+    Nonce nonce = 4;
+    string body = 5;
+    repeated ChatMention mentions = 6;
+}
+
 message AckChannelMessage {
     uint64 channel_id = 1;
     uint64 message_id = 2;
@@ -1185,6 +1312,11 @@ message SendChannelMessageResponse {
 }
 
 message ChannelMessageSent {
+    uint64 channel_id = 1;
+    ChannelMessage message = 2;
+}
+
+message ChannelMessageUpdate {
     uint64 channel_id = 1;
     ChannelMessage message = 2;
 }
@@ -1220,6 +1352,7 @@ message ChannelMessage {
     Nonce nonce = 5;
     repeated ChatMention mentions = 6;
     optional uint64 reply_to_message_id = 7;
+    optional uint64 edited_at = 8;
 }
 
 message ChatMention {
@@ -1477,7 +1610,7 @@ message BufferState {
     optional string diff_base = 4;
     LineEnding line_ending = 5;
     repeated VectorClockEntry saved_version = 6;
-    string saved_version_fingerprint = 7;
+    reserved 7;
     Timestamp saved_mtime = 8;
 }
 
@@ -1687,6 +1820,10 @@ message DeleteNotification {
     uint64 notification_id = 1;
 }
 
+message UpdateNotification {
+    Notification notification = 1;
+}
+
 message MarkNotificationRead {
     uint64 notification_id = 1;
 }
@@ -1716,4 +1853,141 @@ message SetRoomParticipantRole {
     uint64 room_id = 1;
     uint64 user_id = 2;
     ChannelRole role = 3;
+}
+
+message CompleteWithLanguageModel {
+    string model = 1;
+    repeated LanguageModelRequestMessage messages = 2;
+    repeated string stop = 3;
+    float temperature = 4;
+}
+
+message LanguageModelRequestMessage {
+    LanguageModelRole role = 1;
+    string content = 2;
+}
+
+enum LanguageModelRole {
+    LanguageModelUser = 0;
+    LanguageModelAssistant = 1;
+    LanguageModelSystem = 2;
+}
+
+message LanguageModelResponseMessage {
+    optional LanguageModelRole role = 1;
+    optional string content = 2;
+}
+
+message LanguageModelResponse {
+    repeated LanguageModelChoiceDelta choices = 1;
+}
+
+message LanguageModelChoiceDelta {
+    uint32 index = 1;
+    LanguageModelResponseMessage delta = 2;
+    optional string finish_reason = 3;
+}
+
+message CountTokensWithLanguageModel {
+    string model = 1;
+    repeated LanguageModelRequestMessage messages = 2;
+}
+
+message CountTokensResponse {
+    uint32 token_count = 1;
+}
+
+message GetCachedEmbeddings {
+    string model = 1;
+    repeated bytes digests = 2;
+}
+
+message GetCachedEmbeddingsResponse {
+    repeated Embedding embeddings = 1;
+}
+
+message ComputeEmbeddings {
+    string model = 1;
+    repeated string texts = 2;
+}
+
+message ComputeEmbeddingsResponse {
+    repeated Embedding embeddings = 1;
+}
+
+message Embedding {
+    bytes digest = 1;
+    repeated float dimensions = 2;
+}
+
+message BlameBuffer {
+    uint64 project_id = 1;
+    uint64 buffer_id = 2;
+    repeated VectorClockEntry version = 3;
+}
+
+message BlameEntry {
+    bytes sha = 1;
+
+    uint32 start_line = 2;
+    uint32 end_line = 3;
+    uint32 original_line_number = 4;
+
+    optional string author = 5;
+    optional string author_mail = 6;
+    optional int64 author_time = 7;
+    optional string author_tz = 8;
+
+    optional string committer = 9;
+    optional string committer_mail = 10;
+    optional int64 committer_time = 11;
+    optional string committer_tz = 12;
+
+    optional string summary = 13;
+    optional string previous = 14;
+
+    string filename = 15;
+}
+
+message CommitMessage {
+    bytes oid = 1;
+    string message = 2;
+}
+
+message CommitPermalink {
+    bytes oid = 1;
+    string permalink = 2;
+}
+
+message BlameBufferResponse {
+    repeated BlameEntry entries = 1;
+    repeated CommitMessage messages = 2;
+    repeated CommitPermalink permalinks = 3;
+    optional string remote_url = 4;
+}
+
+message MultiLspQuery {
+    uint64 project_id = 1;
+    uint64 buffer_id = 2;
+    repeated VectorClockEntry version = 3;
+    oneof strategy {
+        AllLanguageServers all = 4;
+    }
+    oneof request {
+        GetHover get_hover = 5;
+        GetCodeActions get_code_actions = 6;
+    }
+}
+
+message AllLanguageServers {}
+
+message MultiLspQueryResponse {
+    repeated LspResponse responses = 1;
+}
+
+message LspResponse {
+    oneof response {
+        GetHoverResponse get_hover_response = 1;
+        GetCodeActionsResponse get_code_actions_response = 2;
+    }
 }

@@ -45,11 +45,11 @@ impl ScrollAnchor {
 
     pub fn scroll_position(&self, snapshot: &DisplaySnapshot) -> gpui::Point<f32> {
         let mut scroll_position = self.offset;
-        if self.anchor != Anchor::min() {
+        if self.anchor == Anchor::min() {
+            scroll_position.y = 0.;
+        } else {
             let scroll_top = self.anchor.to_display_point(snapshot).row() as f32;
             scroll_position.y = scroll_top + scroll_position.y;
-        } else {
-            scroll_position.y = 0.;
         }
         scroll_position
     }
@@ -182,7 +182,7 @@ impl ScrollManager {
         map: &DisplaySnapshot,
         local: bool,
         autoscroll: bool,
-        workspace_id: Option<i64>,
+        workspace_id: Option<WorkspaceId>,
         cx: &mut ViewContext<Editor>,
     ) {
         let (new_anchor, top_row) = if scroll_position.y <= 0. {
@@ -221,7 +221,7 @@ impl ScrollManager {
         top_row: u32,
         local: bool,
         autoscroll: bool,
-        workspace_id: Option<i64>,
+        workspace_id: Option<WorkspaceId>,
         cx: &mut ViewContext<Editor>,
     ) {
         self.anchor = anchor;

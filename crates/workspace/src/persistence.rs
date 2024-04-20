@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use db::{define_connection, query, sqlez::connection::Connection, sqlez_macros::sql};
-use gpui::{point, size, Axis, Bounds, WindowBounds};
+use gpui::{point, size, Axis, Bounds};
 
 use sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
@@ -59,7 +59,7 @@ impl sqlez::bindable::Column for SerializedAxis {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SerializedWindowsBounds(pub(crate) WindowBounds);
+pub(crate) struct SerializedWindowsBounds(pub(crate) Bounds<gpui::DevicePixels>);
 
 impl StaticColumnCount for SerializedWindowsBounds {
     fn column_count() -> usize {
@@ -69,30 +69,15 @@ impl StaticColumnCount for SerializedWindowsBounds {
 
 impl Bind for SerializedWindowsBounds {
     fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
-        let (region, next_index) = match self.0 {
-            WindowBounds::Fullscreen => {
-                let next_index = statement.bind(&"Fullscreen", start_index)?;
-                (None, next_index)
-            }
-            WindowBounds::Maximized => {
-                let next_index = statement.bind(&"Maximized", start_index)?;
-                (None, next_index)
-            }
-            WindowBounds::Fixed(region) => {
-                let next_index = statement.bind(&"Fixed", start_index)?;
-                (Some(region), next_index)
-            }
-        };
+        let next_index = statement.bind(&"Fixed", start_index)?;
 
         statement.bind(
-            &region.map(|region| {
-                (
-                    SerializedGlobalPixels(region.origin.x),
-                    SerializedGlobalPixels(region.origin.y),
-                    SerializedGlobalPixels(region.size.width),
-                    SerializedGlobalPixels(region.size.height),
-                )
-            }),
+            &(
+                SerializedDevicePixels(self.0.origin.x),
+                SerializedDevicePixels(self.0.origin.y),
+                SerializedDevicePixels(self.0.size.width),
+                SerializedDevicePixels(self.0.size.height),
+            ),
             next_index,
         )
     }
@@ -102,18 +87,16 @@ impl Column for SerializedWindowsBounds {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (window_state, next_index) = String::column(statement, start_index)?;
         let bounds = match window_state.as_str() {
-            "Fullscreen" => SerializedWindowsBounds(WindowBounds::Fullscreen),
-            "Maximized" => SerializedWindowsBounds(WindowBounds::Maximized),
             "Fixed" => {
                 let ((x, y, width, height), _) = Column::column(statement, next_index)?;
-                let x: f64 = x;
-                let y: f64 = y;
-                let width: f64 = width;
-                let height: f64 = height;
-                SerializedWindowsBounds(WindowBounds::Fixed(Bounds {
+                let x: i32 = x;
+                let y: i32 = y;
+                let width: i32 = width;
+                let height: i32 = height;
+                SerializedWindowsBounds(Bounds {
                     origin: point(x.into(), y.into()),
                     size: size(width.into(), height.into()),
-                }))
+                })
             }
             _ => bail!("Window State did not have a valid string"),
         };
@@ -123,17 +106,16 @@ impl Column for SerializedWindowsBounds {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct SerializedGlobalPixels(gpui::GlobalPixels);
-impl sqlez::bindable::StaticColumnCount for SerializedGlobalPixels {}
+struct SerializedDevicePixels(gpui::DevicePixels);
+impl sqlez::bindable::StaticColumnCount for SerializedDevicePixels {}
 
-impl sqlez::bindable::Bind for SerializedGlobalPixels {
+impl sqlez::bindable::Bind for SerializedDevicePixels {
     fn bind(
         &self,
         statement: &sqlez::statement::Statement,
         start_index: i32,
     ) -> anyhow::Result<i32> {
-        let this: f64 = self.0.into();
-        let this: f32 = this as _;
+        let this: i32 = self.0.into();
         this.bind(statement, start_index)
     }
 }
@@ -155,6 +137,8 @@ define_connection! {
     //   window_width: Option<f32>, // WindowBounds::Fixed RectF width
     //   window_height: Option<f32>, // WindowBounds::Fixed RectF height
     //   display: Option<Uuid>, // Display id
+    //   fullscreen: Option<bool>, // Is the window fullscreen?
+    //   centered_layout: Option<bool>, // Is the Centered Layout mode activated?
     // )
     //
     // pane_groups(
@@ -185,6 +169,7 @@ define_connection! {
     //     kind: String, // Indicates which view this connects to. This is the key in the item_deserializers global
     //     position: usize, // Position of the item in the parent pane. This is equivalent to panes' position column
     //     active: bool, // Indicates if this item is the active one in the pane
+    //     preview: bool // Indicates if this item is a preview item
     // )
     pub static ref DB: WorkspaceDb<()> =
     &[sql!(
@@ -291,7 +276,19 @@ define_connection! {
     // Add pane group flex data
     sql!(
         ALTER TABLE pane_groups ADD COLUMN flexes TEXT;
-    )
+    ),
+    // Add fullscreen field to workspace
+    sql!(
+        ALTER TABLE workspaces ADD COLUMN fullscreen INTEGER; //bool
+    ),
+    // Add preview field to items
+    sql!(
+        ALTER TABLE items ADD COLUMN preview INTEGER; //bool
+    ),
+    // Add centered_layout field to workspace
+    sql!(
+        ALTER TABLE workspaces ADD COLUMN centered_layout INTEGER; //bool
+    ),
     ];
 }
 
@@ -307,11 +304,13 @@ impl WorkspaceDb {
 
         // Note that we re-assign the workspace_id here in case it's empty
         // and we've grabbed the most recent workspace
-        let (workspace_id, workspace_location, bounds, display, docks): (
+        let (workspace_id, workspace_location, bounds, display, fullscreen, centered_layout, docks): (
             WorkspaceId,
             WorkspaceLocation,
             Option<SerializedWindowsBounds>,
             Option<Uuid>,
+            Option<bool>,
+            Option<bool>,
             DockStructure,
         ) = self
             .select_row_bound(sql! {
@@ -324,6 +323,8 @@ impl WorkspaceDb {
                     window_width,
                     window_height,
                     display,
+                    fullscreen,
+                    centered_layout,
                     left_dock_visible,
                     left_dock_active_panel,
                     left_dock_zoom,
@@ -349,6 +350,8 @@ impl WorkspaceDb {
                 .context("Getting center group")
                 .log_err()?,
             bounds: bounds.map(|bounds| bounds.0),
+            fullscreen: fullscreen.unwrap_or(false),
+            centered_layout: centered_layout.unwrap_or(false),
             display,
             docks,
         })
@@ -363,7 +366,7 @@ impl WorkspaceDb {
                 conn.exec_bound(sql!(
                     DELETE FROM pane_groups WHERE workspace_id = ?1;
                     DELETE FROM panes WHERE workspace_id = ?1;))?(workspace.id)
-                .expect("Clearing old panes");
+                .context("Clearing old panes")?;
 
                 conn.exec_bound(sql!(
                     DELETE FROM workspaces WHERE workspace_location = ? AND workspace_id != ?
@@ -426,6 +429,16 @@ impl WorkspaceDb {
             FROM workspaces
             WHERE workspace_location IS NOT NULL
             ORDER BY timestamp DESC
+        }
+    }
+
+    query! {
+        pub fn last_window() -> Result<(Option<Uuid>, Option<SerializedWindowsBounds>, Option<bool>)> {
+            SELECT display, window_state, window_x, window_y, window_width, window_height, fullscreen
+            FROM workspaces
+            WHERE workspace_location IS NOT NULL
+            ORDER BY timestamp DESC
+            LIMIT 1
         }
     }
 
@@ -623,7 +636,7 @@ impl WorkspaceDb {
 
     fn get_items(&self, pane_id: PaneId) -> Result<Vec<SerializedItem>> {
         self.select_bound(sql!(
-            SELECT kind, item_id, active FROM items
+            SELECT kind, item_id, active, preview FROM items
             WHERE pane_id = ?
                 ORDER BY position
         ))?(pane_id)
@@ -636,7 +649,7 @@ impl WorkspaceDb {
         items: &[SerializedItem],
     ) -> Result<()> {
         let mut insert = conn.exec_bound(sql!(
-            INSERT INTO items(workspace_id, pane_id, position, kind, item_id, active) VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO items(workspace_id, pane_id, position, kind, item_id, active, preview) VALUES (?, ?, ?, ?, ?, ?, ?)
         )).context("Preparing insertion")?;
         for (position, item) in items.iter().enumerate() {
             insert((workspace_id, pane_id, position, item))?;
@@ -662,6 +675,22 @@ impl WorkspaceDb {
                 window_width = ?5,
                 window_height = ?6,
                 display = ?7
+            WHERE workspace_id = ?1
+        }
+    }
+
+    query! {
+        pub(crate) async fn set_fullscreen(workspace_id: WorkspaceId, fullscreen: bool) -> Result<()> {
+            UPDATE workspaces
+            SET fullscreen = ?2
+            WHERE workspace_id = ?1
+        }
+    }
+
+    query! {
+        pub(crate) async fn set_centered_layout(workspace_id: WorkspaceId, centered_layout: bool) -> Result<()> {
+            UPDATE workspaces
+            SET centered_layout = ?2
             WHERE workspace_id = ?1
         }
     }
@@ -744,21 +773,25 @@ mod tests {
         .unwrap();
 
         let mut workspace_1 = SerializedWorkspace {
-            id: 1,
+            id: WorkspaceId(1),
             location: (["/tmp", "/tmp2"]).into(),
             center_group: Default::default(),
             bounds: Default::default(),
             display: Default::default(),
             docks: Default::default(),
+            fullscreen: false,
+            centered_layout: false,
         };
 
         let workspace_2 = SerializedWorkspace {
-            id: 2,
+            id: WorkspaceId(2),
             location: (["/tmp"]).into(),
             center_group: Default::default(),
             bounds: Default::default(),
             display: Default::default(),
             docks: Default::default(),
+            fullscreen: false,
+            centered_layout: false,
         };
 
         db.save_workspace(workspace_1.clone()).await;
@@ -826,15 +859,15 @@ mod tests {
                     vec![
                         SerializedPaneGroup::Pane(SerializedPane::new(
                             vec![
-                                SerializedItem::new("Terminal", 5, false),
-                                SerializedItem::new("Terminal", 6, true),
+                                SerializedItem::new("Terminal", 5, false, false),
+                                SerializedItem::new("Terminal", 6, true, false),
                             ],
                             false,
                         )),
                         SerializedPaneGroup::Pane(SerializedPane::new(
                             vec![
-                                SerializedItem::new("Terminal", 7, true),
-                                SerializedItem::new("Terminal", 8, false),
+                                SerializedItem::new("Terminal", 7, true, false),
+                                SerializedItem::new("Terminal", 8, false, false),
                             ],
                             false,
                         )),
@@ -842,8 +875,8 @@ mod tests {
                 ),
                 SerializedPaneGroup::Pane(SerializedPane::new(
                     vec![
-                        SerializedItem::new("Terminal", 9, false),
-                        SerializedItem::new("Terminal", 10, true),
+                        SerializedItem::new("Terminal", 9, false, false),
+                        SerializedItem::new("Terminal", 10, true, false),
                     ],
                     false,
                 )),
@@ -851,12 +884,14 @@ mod tests {
         );
 
         let workspace = SerializedWorkspace {
-            id: 5,
+            id: WorkspaceId(5),
             location: (["/tmp", "/tmp2"]).into(),
             center_group,
             bounds: Default::default(),
             display: Default::default(),
             docks: Default::default(),
+            fullscreen: false,
+            centered_layout: false,
         };
 
         db.save_workspace(workspace.clone()).await;
@@ -879,21 +914,25 @@ mod tests {
         let db = WorkspaceDb(open_test_db("test_basic_functionality").await);
 
         let workspace_1 = SerializedWorkspace {
-            id: 1,
+            id: WorkspaceId(1),
             location: (["/tmp", "/tmp2"]).into(),
             center_group: Default::default(),
             bounds: Default::default(),
             display: Default::default(),
             docks: Default::default(),
+            fullscreen: false,
+            centered_layout: false,
         };
 
         let mut workspace_2 = SerializedWorkspace {
-            id: 2,
+            id: WorkspaceId(2),
             location: (["/tmp"]).into(),
             center_group: Default::default(),
             bounds: Default::default(),
             display: Default::default(),
             docks: Default::default(),
+            fullscreen: false,
+            centered_layout: false,
         };
 
         db.save_workspace(workspace_1.clone()).await;
@@ -924,12 +963,14 @@ mod tests {
 
         // Test other mechanism for mutating
         let mut workspace_3 = SerializedWorkspace {
-            id: 3,
+            id: WorkspaceId(3),
             location: (&["/tmp", "/tmp2"]).into(),
             center_group: Default::default(),
             bounds: Default::default(),
             display: Default::default(),
             docks: Default::default(),
+            fullscreen: false,
+            centered_layout: false,
         };
 
         db.save_workspace(workspace_3.clone()).await;
@@ -957,12 +998,14 @@ mod tests {
         center_group: &SerializedPaneGroup,
     ) -> SerializedWorkspace {
         SerializedWorkspace {
-            id: 4,
+            id: WorkspaceId(4),
             location: workspace_id.into(),
             center_group: center_group.clone(),
             bounds: Default::default(),
             display: Default::default(),
             docks: Default::default(),
+            fullscreen: false,
+            centered_layout: false,
         }
     }
 
@@ -985,15 +1028,15 @@ mod tests {
                     vec![
                         SerializedPaneGroup::Pane(SerializedPane::new(
                             vec![
-                                SerializedItem::new("Terminal", 1, false),
-                                SerializedItem::new("Terminal", 2, true),
+                                SerializedItem::new("Terminal", 1, false, false),
+                                SerializedItem::new("Terminal", 2, true, false),
                             ],
                             false,
                         )),
                         SerializedPaneGroup::Pane(SerializedPane::new(
                             vec![
-                                SerializedItem::new("Terminal", 4, false),
-                                SerializedItem::new("Terminal", 3, true),
+                                SerializedItem::new("Terminal", 4, false, false),
+                                SerializedItem::new("Terminal", 3, true, false),
                             ],
                             true,
                         )),
@@ -1001,8 +1044,8 @@ mod tests {
                 ),
                 SerializedPaneGroup::Pane(SerializedPane::new(
                     vec![
-                        SerializedItem::new("Terminal", 5, true),
-                        SerializedItem::new("Terminal", 6, false),
+                        SerializedItem::new("Terminal", 5, true, false),
+                        SerializedItem::new("Terminal", 6, false, false),
                     ],
                     false,
                 )),
@@ -1032,15 +1075,15 @@ mod tests {
                     vec![
                         SerializedPaneGroup::Pane(SerializedPane::new(
                             vec![
-                                SerializedItem::new("Terminal", 1, false),
-                                SerializedItem::new("Terminal", 2, true),
+                                SerializedItem::new("Terminal", 1, false, false),
+                                SerializedItem::new("Terminal", 2, true, false),
                             ],
                             false,
                         )),
                         SerializedPaneGroup::Pane(SerializedPane::new(
                             vec![
-                                SerializedItem::new("Terminal", 4, false),
-                                SerializedItem::new("Terminal", 3, true),
+                                SerializedItem::new("Terminal", 4, false, false),
+                                SerializedItem::new("Terminal", 3, true, false),
                             ],
                             true,
                         )),
@@ -1048,8 +1091,8 @@ mod tests {
                 ),
                 SerializedPaneGroup::Pane(SerializedPane::new(
                     vec![
-                        SerializedItem::new("Terminal", 5, false),
-                        SerializedItem::new("Terminal", 6, true),
+                        SerializedItem::new("Terminal", 5, false, false),
+                        SerializedItem::new("Terminal", 6, true, false),
                     ],
                     false,
                 )),
@@ -1067,15 +1110,15 @@ mod tests {
             vec![
                 SerializedPaneGroup::Pane(SerializedPane::new(
                     vec![
-                        SerializedItem::new("Terminal", 1, false),
-                        SerializedItem::new("Terminal", 2, true),
+                        SerializedItem::new("Terminal", 1, false, false),
+                        SerializedItem::new("Terminal", 2, true, false),
                     ],
                     false,
                 )),
                 SerializedPaneGroup::Pane(SerializedPane::new(
                     vec![
-                        SerializedItem::new("Terminal", 4, true),
-                        SerializedItem::new("Terminal", 3, false),
+                        SerializedItem::new("Terminal", 4, true, false),
+                        SerializedItem::new("Terminal", 3, false, false),
                     ],
                     true,
                 )),

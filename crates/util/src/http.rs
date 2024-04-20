@@ -1,17 +1,18 @@
 use crate::http_proxy_from_env;
 pub use anyhow::{anyhow, Result};
 use futures::future::BoxFuture;
+use futures_lite::FutureExt;
 use isahc::config::{Configurable, RedirectPolicy};
 pub use isahc::{
     http::{Method, StatusCode, Uri},
-    Error,
+    AsyncBody, Error, HttpClient as IsahcHttpClient, Request, Response,
 };
-pub use isahc::{AsyncBody, Request, Response};
-use parking_lot::Mutex;
-use smol::future::FutureExt;
 #[cfg(feature = "test-support")]
 use std::fmt;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 pub use url::Url;
 
 /// An [`HttpClient`] that has a base URL.
@@ -31,22 +32,30 @@ impl HttpClientWithUrl {
 
     /// Returns the base URL.
     pub fn base_url(&self) -> String {
-        self.base_url.lock().clone()
+        self.base_url
+            .lock()
+            .map_or_else(|_| Default::default(), |url| url.clone())
     }
 
     /// Sets the base URL.
     pub fn set_base_url(&self, base_url: impl Into<String>) {
-        *self.base_url.lock() = base_url.into();
+        let base_url = base_url.into();
+        self.base_url
+            .lock()
+            .map(|mut url| {
+                *url = base_url;
+            })
+            .ok();
     }
 
     /// Builds a URL using the given path.
     pub fn build_url(&self, path: &str) -> String {
-        format!("{}{}", self.base_url.lock(), path)
+        format!("{}{}", self.base_url(), path)
     }
 
     /// Builds a Zed API URL using the given path.
-    pub fn build_zed_api_url(&self, path: &str) -> String {
-        let base_url = self.base_url.lock().clone();
+    pub fn build_zed_api_url(&self, path: &str, query: &[(&str, &str)]) -> Result<Url> {
+        let base_url = self.base_url();
         let base_api_url = match base_url.as_ref() {
             "https://zed.dev" => "https://api.zed.dev",
             "https://staging.zed.dev" => "https://api-staging.zed.dev",
@@ -54,24 +63,36 @@ impl HttpClientWithUrl {
             other => other,
         };
 
-        format!("{}{}", base_api_url, path)
+        Ok(Url::parse_with_params(
+            &format!("{}{}", base_api_url, path),
+            query,
+        )?)
     }
 }
 
 impl HttpClient for Arc<HttpClientWithUrl> {
-    fn send(&self, req: Request<AsyncBody>) -> BoxFuture<Result<Response<AsyncBody>, Error>> {
+    fn send(
+        &self,
+        req: Request<AsyncBody>,
+    ) -> BoxFuture<'static, Result<Response<AsyncBody>, Error>> {
         self.client.send(req)
     }
 }
 
 impl HttpClient for HttpClientWithUrl {
-    fn send(&self, req: Request<AsyncBody>) -> BoxFuture<Result<Response<AsyncBody>, Error>> {
+    fn send(
+        &self,
+        req: Request<AsyncBody>,
+    ) -> BoxFuture<'static, Result<Response<AsyncBody>, Error>> {
         self.client.send(req)
     }
 }
 
 pub trait HttpClient: Send + Sync {
-    fn send(&self, req: Request<AsyncBody>) -> BoxFuture<Result<Response<AsyncBody>, Error>>;
+    fn send(
+        &self,
+        req: Request<AsyncBody>,
+    ) -> BoxFuture<'static, Result<Response<AsyncBody>, Error>>;
 
     fn get<'a>(
         &'a self,
@@ -123,8 +144,12 @@ pub fn client() -> Arc<dyn HttpClient> {
 }
 
 impl HttpClient for isahc::HttpClient {
-    fn send(&self, req: Request<AsyncBody>) -> BoxFuture<Result<Response<AsyncBody>, Error>> {
-        Box::pin(async move { self.send_async(req).await })
+    fn send(
+        &self,
+        req: Request<AsyncBody>,
+    ) -> BoxFuture<'static, Result<Response<AsyncBody>, Error>> {
+        let client = self.clone();
+        Box::pin(async move { client.send_async(req).await })
     }
 }
 
@@ -184,7 +209,10 @@ impl fmt::Debug for FakeHttpClient {
 
 #[cfg(feature = "test-support")]
 impl HttpClient for FakeHttpClient {
-    fn send(&self, req: Request<AsyncBody>) -> BoxFuture<Result<Response<AsyncBody>, Error>> {
+    fn send(
+        &self,
+        req: Request<AsyncBody>,
+    ) -> BoxFuture<'static, Result<Response<AsyncBody>, Error>> {
         let future = (self.handler)(req);
         Box::pin(async move { future.await.map(Into::into) })
     }

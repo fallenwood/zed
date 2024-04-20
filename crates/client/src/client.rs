@@ -13,11 +13,12 @@ use async_tungstenite::tungstenite::{
 use clock::SystemClock;
 use collections::HashMap;
 use futures::{
-    channel::oneshot, future::LocalBoxFuture, AsyncReadExt, FutureExt, SinkExt, StreamExt,
+    channel::oneshot, future::LocalBoxFuture, AsyncReadExt, FutureExt, SinkExt, Stream, StreamExt,
     TryFutureExt as _, TryStreamExt,
 };
 use gpui::{
-    actions, AnyModel, AnyWeakModel, AppContext, AsyncAppContext, Global, Model, Task, WeakModel,
+    actions, AnyModel, AnyWeakModel, AppContext, AsyncAppContext, BorrowAppContext, Global, Model,
+    Task, WeakModel,
 };
 use lazy_static::lazy_static;
 use parking_lot::RwLock;
@@ -27,8 +28,8 @@ use release_channel::{AppVersion, ReleaseChannel};
 use rpc::proto::{AnyTypedEnvelope, EntityMessage, EnvelopedMessage, PeerId, RequestMessage};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-use settings::{Settings, SettingsStore};
+use settings::{Settings, SettingsSources, SettingsStore};
+use std::fmt;
 use std::{
     any::TypeId,
     convert::TryFrom,
@@ -36,7 +37,10 @@ use std::{
     future::Future,
     marker::PhantomData,
     path::PathBuf,
-    sync::{atomic::AtomicU64, Arc, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Weak,
+    },
     time::{Duration, Instant},
 };
 use telemetry::Telemetry;
@@ -48,6 +52,15 @@ use util::{ResultExt, TryFutureExt};
 pub use rpc::*;
 pub use telemetry_events::Event;
 pub use user::*;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DevServerToken(pub String);
+
+impl fmt::Display for DevServerToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 lazy_static! {
     static ref ZED_SERVER_URL: Option<String> = std::env::var("ZED_SERVER_URL").ok();
@@ -84,15 +97,8 @@ impl Settings for ClientSettings {
 
     type FileContent = ClientSettingsContent;
 
-    fn load(
-        default_value: &Self::FileContent,
-        user_values: &[&Self::FileContent],
-        _: &mut AppContext,
-    ) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        let mut result = Self::load_via_json_merge(default_value, user_values)?;
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
+        let mut result = sources.json_merge::<Self>()?;
         if let Some(server_url) = &*ZED_SERVER_URL {
             result.server_url = server_url.clone()
         }
@@ -126,7 +132,7 @@ pub fn init(client: &Arc<Client>, cx: &mut AppContext) {
         move |_: &SignOut, cx| {
             if let Some(client) = client.upgrade() {
                 cx.spawn(|cx| async move {
-                    client.disconnect(&cx);
+                    client.sign_out(&cx).await;
                 })
                 .detach();
             }
@@ -274,10 +280,22 @@ enum WeakSubscriber {
     Pending(Vec<Box<dyn AnyTypedEnvelope>>),
 }
 
-#[derive(Clone, Debug)]
-pub struct Credentials {
-    pub user_id: u64,
-    pub access_token: String,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Credentials {
+    DevServer { token: DevServerToken },
+    User { user_id: u64, access_token: String },
+}
+
+impl Credentials {
+    pub fn authorization_header(&self) -> String {
+        match self {
+            Credentials::DevServer { token } => format!("dev-server-token {}", token),
+            Credentials::User {
+                user_id,
+                access_token,
+            } => format!("{} {}", user_id, access_token),
+        }
+    }
 }
 
 impl Default for ClientState {
@@ -402,21 +420,19 @@ impl settings::Settings for TelemetrySettings {
 
     type FileContent = TelemetrySettingsContent;
 
-    fn load(
-        default_value: &Self::FileContent,
-        user_values: &[&Self::FileContent],
-        _: &mut AppContext,
-    ) -> Result<Self> {
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
         Ok(Self {
-            diagnostics: user_values.first().and_then(|v| v.diagnostics).unwrap_or(
-                default_value
+            diagnostics: sources.user.as_ref().and_then(|v| v.diagnostics).unwrap_or(
+                sources
+                    .default
                     .diagnostics
                     .ok_or_else(Self::missing_default)?,
             ),
-            metrics: user_values
-                .first()
+            metrics: sources
+                .user
+                .as_ref()
                 .and_then(|v| v.metrics)
-                .unwrap_or(default_value.metrics.ok_or_else(Self::missing_default)?),
+                .unwrap_or(sources.default.metrics.ok_or_else(Self::missing_default)?),
         })
     }
 }
@@ -442,7 +458,7 @@ impl Client {
     }
 
     pub fn id(&self) -> u64 {
-        self.id.load(std::sync::atomic::Ordering::SeqCst)
+        self.id.load(Ordering::SeqCst)
     }
 
     pub fn http_client(&self) -> Arc<HttpClientWithUrl> {
@@ -450,7 +466,7 @@ impl Client {
     }
 
     pub fn set_id(&self, id: u64) -> &Self {
-        self.id.store(id, std::sync::atomic::Ordering::SeqCst);
+        self.id.store(id, Ordering::SeqCst);
         self
     }
 
@@ -494,11 +510,11 @@ impl Client {
     }
 
     pub fn user_id(&self) -> Option<u64> {
-        self.state
-            .read()
-            .credentials
-            .as_ref()
-            .map(|credentials| credentials.user_id)
+        if let Some(Credentials::User { user_id, .. }) = self.state.read().credentials.as_ref() {
+            Some(*user_id)
+        } else {
+            None
+        }
     }
 
     pub fn peer_id(&self) -> Option<PeerId> {
@@ -743,6 +759,11 @@ impl Client {
         read_credentials_from_keychain(cx).await.is_some()
     }
 
+    pub fn set_dev_server_token(&self, token: DevServerToken) -> &Self {
+        self.state.write().credentials = Some(Credentials::DevServer { token });
+        self
+    }
+
     #[async_recursion(?Send)]
     pub async fn authenticate_and_connect(
         self: &Arc<Self>,
@@ -761,7 +782,6 @@ impl Client {
             }
             Status::UpgradeRequired => return Err(EstablishConnectionError::UpgradeRequired)?,
         };
-
         if was_disconnected {
             self.set_status(Status::Authenticating, cx);
         } else {
@@ -793,7 +813,9 @@ impl Client {
             }
         }
         let credentials = credentials.unwrap();
-        self.set_id(credentials.user_id);
+        if let Credentials::User { user_id, .. } = &credentials {
+            self.set_id(*user_id);
+        }
 
         if was_disconnected {
             self.set_status(Status::Connecting, cx);
@@ -809,7 +831,9 @@ impl Client {
                     Ok(conn) => {
                         self.state.write().credentials = Some(credentials.clone());
                         if !read_from_keychain && IMPERSONATE_LOGIN.is_none() {
-                            write_credentials_to_keychain(credentials, cx).await.log_err();
+                            if let Credentials::User{user_id, access_token} = credentials {
+                                write_credentials_to_keychain(user_id, access_token, cx).await.log_err();
+                            }
                         }
 
                         futures::select_biased! {
@@ -1017,10 +1041,7 @@ impl Client {
             .unwrap_or_default();
 
         let request = Request::builder()
-            .header(
-                "Authorization",
-                format!("{} {}", credentials.user_id, credentials.access_token),
-            )
+            .header("Authorization", credentials.authorization_header())
             .header("x-zed-protocol-version", rpc::PROTOCOL_VERSION)
             .header("x-zed-app-version", app_version)
             .header(
@@ -1173,7 +1194,7 @@ impl Client {
                         .decrypt_string(&access_token)
                         .context("failed to decrypt access token")?;
 
-                    Ok(Credentials {
+                    Ok(Credentials::User {
                         user_id: user_id.parse()?,
                         access_token,
                     })
@@ -1223,10 +1244,19 @@ impl Client {
 
         // Use the admin API token to authenticate as the impersonated user.
         api_token.insert_str(0, "ADMIN_TOKEN:");
-        Ok(Credentials {
+        Ok(Credentials::User {
             user_id: response.user.id,
             access_token: api_token,
         })
+    }
+
+    pub async fn sign_out(self: &Arc<Self>, cx: &AsyncAppContext) {
+        self.state.write().credentials = None;
+        self.disconnect(&cx);
+
+        if self.has_keychain_credentials(cx).await {
+            delete_credentials_from_keychain(cx).await.log_err();
+        }
     }
 
     pub fn disconnect(self: &Arc<Self>, cx: &AsyncAppContext) {
@@ -1258,6 +1288,30 @@ impl Client {
     ) -> impl Future<Output = Result<T::Response>> {
         self.request_envelope(request)
             .map_ok(|envelope| envelope.payload)
+    }
+
+    pub fn request_stream<T: RequestMessage>(
+        &self,
+        request: T,
+    ) -> impl Future<Output = Result<impl Stream<Item = Result<T::Response>>>> {
+        let client_id = self.id.load(Ordering::SeqCst);
+        log::debug!(
+            "rpc request start. client_id:{}. name:{}",
+            client_id,
+            T::NAME
+        );
+        let response = self
+            .connection_id()
+            .map(|conn_id| self.peer.request_stream(conn_id, request));
+        async move {
+            let response = response?.await;
+            log::debug!(
+                "rpc request finish. client_id:{}. name:{}",
+                client_id,
+                T::NAME
+            );
+            response
+        }
     }
 
     pub fn request_envelope<T: RequestMessage>(
@@ -1412,21 +1466,22 @@ async fn read_credentials_from_keychain(cx: &AsyncAppContext) -> Option<Credenti
         .await
         .log_err()??;
 
-    Some(Credentials {
+    Some(Credentials::User {
         user_id: user_id.parse().ok()?,
         access_token: String::from_utf8(access_token).ok()?,
     })
 }
 
 async fn write_credentials_to_keychain(
-    credentials: Credentials,
+    user_id: u64,
+    access_token: String,
     cx: &AsyncAppContext,
 ) -> Result<()> {
     cx.update(move |cx| {
         cx.write_credentials(
             &ClientSettings::get_global(cx).server_url,
-            &credentials.user_id.to_string(),
-            credentials.access_token.as_bytes(),
+            &user_id.to_string(),
+            access_token.as_bytes(),
         )
     })?
     .await
@@ -1531,7 +1586,7 @@ mod tests {
         // Time out when client tries to connect.
         client.override_authenticate(move |cx| {
             cx.background_executor().spawn(async move {
-                Ok(Credentials {
+                Ok(Credentials::User {
                     user_id,
                     access_token: "token".into(),
                 })

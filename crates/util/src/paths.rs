@@ -63,6 +63,7 @@ lazy_static::lazy_static! {
     pub static ref OLD_LOG: PathBuf = LOGS_DIR.join("Zed.log.old");
     pub static ref LOCAL_SETTINGS_RELATIVE_PATH: &'static Path = Path::new(".zed/settings.json");
     pub static ref LOCAL_TASKS_RELATIVE_PATH: &'static Path = Path::new(".zed/tasks.json");
+    pub static ref LOCAL_VSCODE_TASKS_RELATIVE_PATH: &'static Path = Path::new(".vscode/tasks.json");
     pub static ref TEMP_DIR: PathBuf = if cfg!(target_os = "widows") {
         dirs::data_local_dir()
             .expect("failed to determine LocalAppData directory")
@@ -204,23 +205,27 @@ impl<P> PathLikeWithPosition<P> {
                                     column: None,
                                 })
                             } else {
-                                let maybe_col_str =
-                                    if maybe_col_str.ends_with(FILE_ROW_COLUMN_DELIMITER) {
-                                        &maybe_col_str[..maybe_col_str.len() - 1]
-                                    } else {
-                                        maybe_col_str
-                                    };
+                                let (maybe_col_str, _) =
+                                    maybe_col_str.split_once(':').unwrap_or((maybe_col_str, ""));
                                 match maybe_col_str.parse::<u32>() {
                                     Ok(col) => Ok(Self {
                                         path_like: parse_path_like_str(path_like_str)?,
                                         row: Some(row),
                                         column: Some(col),
                                     }),
-                                    Err(_) => fallback(s),
+                                    Err(_) => Ok(Self {
+                                        path_like: parse_path_like_str(path_like_str)?,
+                                        row: Some(row),
+                                        column: None,
+                                    }),
                                 }
                             }
                         }
-                        Err(_) => fallback(s),
+                        Err(_) => Ok(Self {
+                            path_like: parse_path_like_str(path_like_str)?,
+                            row: None,
+                            column: None,
+                        }),
                     }
                 }
             }
@@ -351,23 +356,23 @@ mod tests {
 
     #[test]
     fn path_with_position_parsing_negative() {
-        for input in [
-            "test_file.rs:a",
-            "test_file.rs:a:b",
-            "test_file.rs::",
-            "test_file.rs::1",
-            "test_file.rs:1::",
-            "test_file.rs::1:2",
-            "test_file.rs:1::2",
-            "test_file.rs:1:2:3",
+        for (input, row, column) in [
+            ("test_file.rs:a", None, None),
+            ("test_file.rs:a:b", None, None),
+            ("test_file.rs::", None, None),
+            ("test_file.rs::1", None, None),
+            ("test_file.rs:1::", Some(1), None),
+            ("test_file.rs::1:2", None, None),
+            ("test_file.rs:1::2", Some(1), None),
+            ("test_file.rs:1:2:3", Some(1), Some(2)),
         ] {
             let actual = parse_str(input);
             assert_eq!(
                 actual,
                 PathLikeWithPosition {
-                    path_like: input.to_string(),
-                    row: None,
-                    column: None,
+                    path_like: "test_file.rs".to_string(),
+                    row,
+                    column,
                 },
                 "For negative case input str '{input}', got a parse mismatch"
             );
