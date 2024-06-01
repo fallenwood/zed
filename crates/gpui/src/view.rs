@@ -280,6 +280,14 @@ impl<V: Render> From<View<V>> for AnyView {
     }
 }
 
+impl PartialEq for AnyView {
+    fn eq(&self, other: &Self) -> bool {
+        self.model == other.model
+    }
+}
+
+impl Eq for AnyView {}
+
 impl Element for AnyView {
     type RequestLayoutState = Option<AnyElement>;
     type PrepaintState = Option<AnyElement>;
@@ -296,7 +304,7 @@ impl Element for AnyView {
         if let Some(style) = self.cached_style.as_ref() {
             let mut root_style = Style::default();
             root_style.refine(style);
-            let layout_id = cx.request_layout(&root_style, None);
+            let layout_id = cx.request_layout(root_style, None);
             (layout_id, None)
         } else {
             let mut element = (self.render)(self, cx);

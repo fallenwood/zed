@@ -291,6 +291,8 @@ impl Interactivity {
                 let action = action.downcast_ref().unwrap();
                 if phase == DispatchPhase::Capture {
                     (listener)(action, cx)
+                } else {
+                    cx.propagate();
                 }
             }),
         ));
@@ -1139,7 +1141,7 @@ impl Element for Div {
                         .iter_mut()
                         .map(|child| child.request_layout(cx))
                         .collect::<SmallVec<_>>();
-                    cx.request_layout(&style, child_layout_ids.iter().copied())
+                    cx.request_layout(style, child_layout_ids.iter().copied())
                 })
             });
         (layout_id, DivFrameState { child_layout_ids })
@@ -2337,7 +2339,7 @@ impl<E> ParentElement for Focusable<E>
 where
     E: ParentElement,
 {
-    fn extend(&mut self, elements: impl Iterator<Item = AnyElement>) {
+    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
         self.element.extend(elements)
     }
 }
@@ -2430,7 +2432,7 @@ impl<E> ParentElement for Stateful<E>
 where
     E: ParentElement,
 {
-    fn extend(&mut self, elements: impl Iterator<Item = AnyElement>) {
+    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
         self.element.extend(elements)
     }
 }

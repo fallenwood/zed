@@ -1,8 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use language::{ContextProviderWithTasks, LanguageServerName, LspAdapter, LspAdapterDelegate};
+use language::{LanguageServerName, LspAdapter, LspAdapterDelegate};
 use lsp::LanguageServerBinary;
 use node_runtime::NodeRuntime;
+use project::ContextProviderWithTasks;
 use std::{
     any::Any,
     ffi::OsString,
@@ -187,7 +188,6 @@ pub(super) fn python_task_context() -> ContextProviderWithTasks {
             label: "execute selection".to_owned(),
             command: "python3".to_owned(),
             args: vec!["-c".to_owned(), VariableName::SelectedText.template_value()],
-            ignore_previously_resolved: true,
             ..TaskTemplate::default()
         },
         TaskTemplate {

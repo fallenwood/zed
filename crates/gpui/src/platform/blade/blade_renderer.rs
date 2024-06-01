@@ -1,7 +1,7 @@
 // Doing `if let` gives you nice scoping with passes/encoders
 #![allow(irrefutable_let_patterns)]
 
-use super::{BladeAtlas, BladeBelt, BladeBeltDescriptor, PATH_TEXTURE_FORMAT};
+use super::{BladeAtlas, PATH_TEXTURE_FORMAT};
 use crate::{
     AtlasTextureKind, AtlasTile, Bounds, ContentMask, Hsla, MonochromeSprite, Path, PathId,
     PathVertex, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
@@ -15,11 +15,14 @@ use media::core_video::CVMetalTextureCache;
 use std::{ffi::c_void, ptr::NonNull};
 
 use blade_graphics as gpu;
+use blade_util::{BufferBelt, BufferBeltDescriptor};
 use std::{mem, sync::Arc};
 
 const MAX_FRAME_TIME_MS: u32 = 1000;
 
+#[cfg(target_os = "macos")]
 pub type Context = ();
+#[cfg(target_os = "macos")]
 pub type Renderer = BladeRenderer;
 
 #[cfg(target_os = "macos")]
@@ -346,7 +349,7 @@ pub struct BladeRenderer {
     command_encoder: gpu::CommandEncoder,
     last_sync_point: Option<gpu::SyncPoint>,
     pipelines: BladePipelines,
-    instance_belt: BladeBelt,
+    instance_belt: BufferBelt,
     path_tiles: HashMap<PathId, AtlasTile>,
     atlas: Arc<BladeAtlas>,
     atlas_sampler: gpu::Sampler,
@@ -360,9 +363,7 @@ impl BladeRenderer {
             size: config.size,
             usage: gpu::TextureUsage::TARGET,
             display_sync: gpu::DisplaySync::Recent,
-            //Note: this matches the original logic of the Metal backend,
-            // but ultimaterly we need to switch to `Linear`.
-            color_space: gpu::ColorSpace::Srgb,
+            color_space: gpu::ColorSpace::Linear,
             allow_exclusive_full_screen: false,
             transparent: config.transparent,
         };
@@ -373,7 +374,7 @@ impl BladeRenderer {
             buffer_count: 2,
         });
         let pipelines = BladePipelines::new(&gpu, surface_info);
-        let instance_belt = BladeBelt::new(BladeBeltDescriptor {
+        let instance_belt = BufferBelt::new(BufferBeltDescriptor {
             memory: gpu::Memory::Shared,
             min_chunk_size: 0x1000,
             alignment: 0x40, // Vulkan `minStorageBufferOffsetAlignment` on Intel Xe
@@ -494,7 +495,7 @@ impl BladeRenderer {
                 pad: 0,
             };
 
-            let vertex_buf = unsafe { self.instance_belt.alloc_data(&vertices, &self.gpu) };
+            let vertex_buf = unsafe { self.instance_belt.alloc_typed(&vertices, &self.gpu) };
             let mut pass = self.command_encoder.render(gpu::RenderTargetSet {
                 colors: &[gpu::RenderTarget {
                     view: tex_info.raw_view,
@@ -559,7 +560,7 @@ impl BladeRenderer {
                 match batch {
                     PrimitiveBatch::Quads(quads) => {
                         let instance_buf =
-                            unsafe { self.instance_belt.alloc_data(quads, &self.gpu) };
+                            unsafe { self.instance_belt.alloc_typed(quads, &self.gpu) };
                         let mut encoder = pass.with(&self.pipelines.quads);
                         encoder.bind(
                             0,
@@ -572,7 +573,7 @@ impl BladeRenderer {
                     }
                     PrimitiveBatch::Shadows(shadows) => {
                         let instance_buf =
-                            unsafe { self.instance_belt.alloc_data(shadows, &self.gpu) };
+                            unsafe { self.instance_belt.alloc_typed(shadows, &self.gpu) };
                         let mut encoder = pass.with(&self.pipelines.shadows);
                         encoder.bind(
                             0,
@@ -600,7 +601,7 @@ impl BladeRenderer {
                             }];
 
                             let instance_buf =
-                                unsafe { self.instance_belt.alloc_data(&sprites, &self.gpu) };
+                                unsafe { self.instance_belt.alloc_typed(&sprites, &self.gpu) };
                             encoder.bind(
                                 0,
                                 &ShaderPathsData {
@@ -615,7 +616,7 @@ impl BladeRenderer {
                     }
                     PrimitiveBatch::Underlines(underlines) => {
                         let instance_buf =
-                            unsafe { self.instance_belt.alloc_data(underlines, &self.gpu) };
+                            unsafe { self.instance_belt.alloc_typed(underlines, &self.gpu) };
                         let mut encoder = pass.with(&self.pipelines.underlines);
                         encoder.bind(
                             0,
@@ -632,7 +633,7 @@ impl BladeRenderer {
                     } => {
                         let tex_info = self.atlas.get_texture_info(texture_id);
                         let instance_buf =
-                            unsafe { self.instance_belt.alloc_data(sprites, &self.gpu) };
+                            unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
                         let mut encoder = pass.with(&self.pipelines.mono_sprites);
                         encoder.bind(
                             0,
@@ -651,7 +652,7 @@ impl BladeRenderer {
                     } => {
                         let tex_info = self.atlas.get_texture_info(texture_id);
                         let instance_buf =
-                            unsafe { self.instance_belt.alloc_data(sprites, &self.gpu) };
+                            unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
                         let mut encoder = pass.with(&self.pipelines.poly_sprites);
                         encoder.bind(
                             0,

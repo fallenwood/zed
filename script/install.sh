@@ -80,7 +80,7 @@ linux() {
     mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
 
     # Link the binary
-    ln -sf ~/.local/zed$suffix.app/bin/zed "$HOME/.local/bin/zed"
+    ln -sf ~/.local/zed$suffix.app/bin/cli "$HOME/.local/bin/zed"
 
     # Copy .desktop file
     desktop_file_path="$HOME/.local/share/applications/${appid}.desktop"
@@ -112,7 +112,19 @@ macos() {
     ditto "$temp/mount/$app" "/Applications/$app"
     hdiutil detach -quiet "$temp/mount"
 
-    echo "Zed has been installed. Run with 'open /Applications/$app'"
+    mkdir -p "$HOME/.local/bin"
+    # Link the binary
+    ln -sf /Applications/$app/Contents/MacOS/cli "$HOME/.local/bin/zed"
+
+    if which "zed" >/dev/null 2>&1; then
+        echo "Zed has been installed. Run with 'zed'"
+    else
+        echo "To run Zed from your terminal, you must add ~/.local/bin to your PATH"
+        echo "Run:"
+        echo "   echo 'export PATH=\$HOME/.local/bin:\$PATH' >> ~/.bashrc"
+        echo "   source ~/.bashrc"
+        echo "To run Zed now, '~/.local/bin/zed'"
+    fi
 }
 
 main "$@"

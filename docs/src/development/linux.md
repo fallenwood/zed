@@ -2,11 +2,7 @@
 
 ## Repository
 
-After cloning the repository, ensure all git submodules are initialized:
-
-```shell
-git submodule update --init --recursive
-```
+Clone down the [Zed repository](https://github.com/zed-industries/zed).
 
 ## Dependencies
 
@@ -73,6 +69,18 @@ cargo test --workspace
 ## Wayland & X11
 
 Zed has basic support for both modes. The mode is selected at runtime. If you're on wayland and want to run in X11 mode, you can set `WAYLAND_DISPLAY='' cargo run` to do so.
+
+## Flatpak
+
+> [!WARNING]
+> Zed's current Flatpak integration simply exits the sandbox on startup. Workflows that rely on Flatpak's sandboxing may not work as expected. 
+
+To build & install the Flatpak package locally follow the steps below:
+
+1. Install Flatpak for your distribution as outlined [here](https://flathub.org/setup).
+2. Run the `script/flatpak/deps` script to install the required dependencies.
+3. Run `script/flatpak/bundle-flatpak`.
+4. Now the package has been installed and has a bundle available at `target/release/{app-id}.flatpak`.
 
 ## Troubleshooting
 

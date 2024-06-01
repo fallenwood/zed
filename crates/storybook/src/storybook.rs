@@ -7,7 +7,8 @@ mod story_selector;
 use clap::Parser;
 use dialoguer::FuzzySelect;
 use gpui::{
-    div, px, size, AnyView, AppContext, Bounds, Render, ViewContext, VisualContext, WindowOptions,
+    div, px, size, AnyView, AppContext, Bounds, Render, ViewContext, VisualContext, WindowBounds,
+    WindowOptions,
 };
 use log::LevelFilter;
 use project::Project;
@@ -85,7 +86,7 @@ fn main() {
         let bounds = Bounds::centered(None, size, cx);
         let _window = cx.open_window(
             WindowOptions {
-                bounds: Some(bounds),
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
             move |cx| {
@@ -127,7 +128,10 @@ fn load_embedded_fonts(cx: &AppContext) -> gpui::Result<()> {
     let mut embedded_fonts = Vec::new();
     for font_path in font_paths {
         if font_path.ends_with(".ttf") {
-            let font_bytes = cx.asset_source().load(&font_path)?;
+            let font_bytes = cx
+                .asset_source()
+                .load(&font_path)?
+                .expect("Should never be None in the storybook");
             embedded_fonts.push(font_bytes);
         }
     }

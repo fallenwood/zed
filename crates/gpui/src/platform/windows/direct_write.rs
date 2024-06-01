@@ -8,7 +8,6 @@ use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
 use windows::{
     core::*,
-    Foundation::Numerics::Matrix3x2,
     Win32::{
         Foundation::*,
         Globalization::GetUserDefaultLocaleName,
@@ -45,6 +44,12 @@ struct DirectWriteComponent {
     in_memory_loader: IDWriteInMemoryFontFileLoader,
     builder: IDWriteFontSetBuilder1,
     text_renderer: Arc<TextRendererWrapper>,
+    render_context: GlyphRenderContext,
+}
+
+struct GlyphRenderContext {
+    params: IDWriteRenderingParams3,
+    dc_target: ID2D1DeviceContext4,
 }
 
 // All use of the IUnknown methods should be "thread-safe".
@@ -58,7 +63,14 @@ struct DirectWriteState {
     custom_font_collection: IDWriteFontCollection1,
     fonts: Vec<FontInfo>,
     font_selections: HashMap<Font, FontId>,
-    font_id_by_postscript_name: HashMap<String, FontId>,
+    font_id_by_identifier: HashMap<FontIdentifier, FontId>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct FontIdentifier {
+    postscript_name: String,
+    weight: i32,
+    style: i32,
 }
 
 impl DirectWriteComponent {
@@ -74,11 +86,12 @@ impl DirectWriteComponent {
             // `DirectWriteTextSystem` to run on `win10 1703`+.
             let in_memory_loader = factory.CreateInMemoryFontFileLoader()?;
             factory.RegisterFontFileLoader(&in_memory_loader)?;
-            let builder = factory.CreateFontSetBuilder2()?;
+            let builder = factory.CreateFontSetBuilder()?;
             let mut locale_vec = vec![0u16; LOCALE_NAME_MAX_LENGTH as usize];
             GetUserDefaultLocaleName(&mut locale_vec);
             let locale = String::from_utf16_lossy(&locale_vec);
             let text_renderer = Arc::new(TextRendererWrapper::new(&locale));
+            let render_context = GlyphRenderContext::new(&factory, &d2d1_factory)?;
 
             Ok(DirectWriteComponent {
                 locale,
@@ -88,7 +101,43 @@ impl DirectWriteComponent {
                 in_memory_loader,
                 builder,
                 text_renderer,
+                render_context,
             })
+        }
+    }
+}
+
+impl GlyphRenderContext {
+    pub fn new(factory: &IDWriteFactory5, d2d1_factory: &ID2D1Factory) -> Result<Self> {
+        unsafe {
+            let default_params: IDWriteRenderingParams3 =
+                factory.CreateRenderingParams()?.cast()?;
+            let gamma = default_params.GetGamma();
+            let enhanced_contrast = default_params.GetEnhancedContrast();
+            let gray_contrast = default_params.GetGrayscaleEnhancedContrast();
+            let cleartype_level = default_params.GetClearTypeLevel();
+            let grid_fit_mode = default_params.GetGridFitMode();
+
+            let params = factory.CreateCustomRenderingParams(
+                gamma,
+                enhanced_contrast,
+                gray_contrast,
+                cleartype_level,
+                DWRITE_PIXEL_GEOMETRY_RGB,
+                DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
+                grid_fit_mode,
+            )?;
+            let dc_target = {
+                let target = d2d1_factory.CreateDCRenderTarget(&get_render_target_property(
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    D2D1_ALPHA_MODE_PREMULTIPLIED,
+                ))?;
+                let target = target.cast::<ID2D1DeviceContext4>()?;
+                target.SetTextRenderingParams(&params);
+                target
+            };
+
+            Ok(Self { params, dc_target })
         }
     }
 }
@@ -100,7 +149,7 @@ impl DirectWriteTextSystem {
             let mut result = std::mem::zeroed();
             components
                 .factory
-                .GetSystemFontCollection2(false, &mut result, true)?;
+                .GetSystemFontCollection(false, &mut result, true)?;
             result.unwrap()
         };
         let custom_font_set = unsafe { components.builder.CreateFontSet()? };
@@ -118,7 +167,7 @@ impl DirectWriteTextSystem {
             custom_font_collection,
             fonts: Vec::new(),
             font_selections: HashMap::default(),
-            font_id_by_postscript_name: HashMap::default(),
+            font_id_by_identifier: HashMap::default(),
         })))
     }
 }
@@ -269,8 +318,7 @@ impl DirectWriteState {
             let Some(font_face) = font_face_ref.CreateFontFace().log_err() else {
                 continue;
             };
-            let Some(postscript_name) = get_postscript_name(&font_face, &self.components.locale)
-            else {
+            let Some(identifier) = get_font_identifier(&font_face, &self.components.locale) else {
                 continue;
             };
             let is_emoji = font_face.IsColorFont().as_bool();
@@ -287,8 +335,7 @@ impl DirectWriteState {
             };
             let font_id = FontId(self.fonts.len());
             self.fonts.push(font_info);
-            self.font_id_by_postscript_name
-                .insert(postscript_name, font_id);
+            self.font_id_by_identifier.insert(identifier, font_id);
             return Some(font_id);
         }
         None
@@ -298,7 +345,7 @@ impl DirectWriteState {
         let mut collection = std::mem::zeroed();
         self.components
             .factory
-            .GetSystemFontCollection2(false, &mut collection, true)
+            .GetSystemFontCollection(false, &mut collection, true)
             .unwrap();
         self.system_font_collection = collection.unwrap();
     }
@@ -491,7 +538,7 @@ impl DirectWriteState {
         unsafe {
             let font_info = &self.fonts[font_id.0];
             let mut metrics = std::mem::zeroed();
-            font_info.font_face.GetMetrics2(&mut metrics);
+            font_info.font_face.GetMetrics(&mut metrics);
 
             FontMetrics {
                 units_per_em: metrics.Base.designUnitsPerEm as _,
@@ -516,10 +563,12 @@ impl DirectWriteState {
         }
     }
 
-    unsafe fn get_glyphrun_analysis(
-        &self,
-        params: &RenderGlyphParams,
-    ) -> windows::core::Result<IDWriteGlyphRunAnalysis> {
+    fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+        let render_target = &self.components.render_context.dc_target;
+        unsafe {
+            render_target.SetUnitMode(D2D1_UNIT_MODE_DIPS);
+            render_target.SetDpi(96.0 * params.scale_factor, 96.0 * params.scale_factor);
+        }
         let font = &self.fonts[params.font_id.0];
         let glyph_id = [params.glyph_id.0 as u16];
         let advance = [0.0f32];
@@ -534,39 +583,29 @@ impl DirectWriteState {
             isSideways: BOOL(0),
             bidiLevel: 0,
         };
-        let transform = DWRITE_MATRIX {
-            m11: params.scale_factor,
-            m12: 0.0,
-            m21: 0.0,
-            m22: params.scale_factor,
-            dx: 0.0,
-            dy: 0.0,
+        let bounds = unsafe {
+            render_target.GetGlyphRunWorldBounds(
+                D2D_POINT_2F { x: 0.0, y: 0.0 },
+                &glyph_run,
+                DWRITE_MEASURING_MODE_NATURAL,
+            )?
         };
-        self.components.factory.CreateGlyphRunAnalysis(
-            &glyph_run as _,
-            1.0,
-            Some(&transform as _),
-            DWRITE_RENDERING_MODE_NATURAL,
-            DWRITE_MEASURING_MODE_NATURAL,
-            0.0,
-            0.0,
-        )
-    }
 
-    fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
-        unsafe {
-            let glyph_run_analysis = self.get_glyphrun_analysis(params)?;
-            let bounds = glyph_run_analysis.GetAlphaTextureBounds(DWRITE_TEXTURE_CLEARTYPE_3x1)?;
-
+        if bounds.right < bounds.left {
             Ok(Bounds {
-                origin: Point {
-                    x: DevicePixels(bounds.left),
-                    y: DevicePixels(bounds.top),
-                },
-                size: Size {
-                    width: DevicePixels(bounds.right - bounds.left),
-                    height: DevicePixels(bounds.bottom - bounds.top),
-                },
+                origin: point(0.into(), 0.into()),
+                size: size(0.into(), 0.into()),
+            })
+        } else {
+            Ok(Bounds {
+                origin: point(
+                    ((bounds.left * params.scale_factor).ceil() as i32).into(),
+                    ((bounds.top * params.scale_factor).ceil() as i32).into(),
+                ),
+                size: size(
+                    (((bounds.right - bounds.left) * params.scale_factor).ceil() as i32).into(),
+                    (((bounds.bottom - bounds.top) * params.scale_factor).ceil() as i32).into(),
+                ),
             })
         }
     }
@@ -620,66 +659,40 @@ impl DirectWriteState {
             bitmap_size.height += DevicePixels(1);
         }
         let bitmap_size = bitmap_size;
-        let transform = DWRITE_MATRIX {
-            m11: params.scale_factor,
-            m12: 0.0,
-            m21: 0.0,
-            m22: params.scale_factor,
-            dx: 0.0,
-            dy: 0.0,
-        };
-        let brush_property = D2D1_BRUSH_PROPERTIES {
-            opacity: 1.0,
-            transform: Matrix3x2 {
-                M11: params.scale_factor,
-                M12: 0.0,
-                M21: 0.0,
-                M22: params.scale_factor,
-                M31: 0.0,
-                M32: 0.0,
-            },
-        };
 
         let total_bytes;
         let bitmap_format;
         let render_target_property;
+        let bitmap_width;
+        let bitmap_height;
         let bitmap_stride;
+        let bitmap_dpi;
         if params.is_emoji {
             total_bytes = bitmap_size.height.0 as usize * bitmap_size.width.0 as usize * 4;
             bitmap_format = &GUID_WICPixelFormat32bppPBGRA;
-            render_target_property = D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: params.scale_factor * 96.0,
-                dpiY: params.scale_factor * 96.0,
-                usage: D2D1_RENDER_TARGET_USAGE_NONE,
-                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
-            };
+            render_target_property = get_render_target_property(
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                D2D1_ALPHA_MODE_PREMULTIPLIED,
+            );
+            bitmap_width = bitmap_size.width.0 as u32;
+            bitmap_height = bitmap_size.height.0 as u32;
             bitmap_stride = bitmap_size.width.0 as u32 * 4;
+            bitmap_dpi = 96.0;
         } else {
             total_bytes = bitmap_size.height.0 as usize * bitmap_size.width.0 as usize;
             bitmap_format = &GUID_WICPixelFormat8bppAlpha;
-            render_target_property = D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_STRAIGHT,
-                },
-                dpiX: params.scale_factor * 96.0,
-                dpiY: params.scale_factor * 96.0,
-                usage: D2D1_RENDER_TARGET_USAGE_NONE,
-                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
-            };
+            render_target_property =
+                get_render_target_property(DXGI_FORMAT_A8_UNORM, D2D1_ALPHA_MODE_STRAIGHT);
+            bitmap_width = bitmap_size.width.0 as u32 * 2;
+            bitmap_height = bitmap_size.height.0 as u32 * 2;
             bitmap_stride = bitmap_size.width.0 as u32;
+            bitmap_dpi = 192.0;
         }
 
         unsafe {
             let bitmap = self.components.bitmap_factory.CreateBitmap(
-                bitmap_size.width.0 as u32,
-                bitmap_size.height.0 as u32,
+                bitmap_width,
+                bitmap_height,
                 bitmap_format,
                 WICBitmapCacheOnLoad,
             )?;
@@ -687,7 +700,7 @@ impl DirectWriteState {
                 .components
                 .d2d1_factory
                 .CreateWicBitmapRenderTarget(&bitmap, &render_target_property)?;
-            let brush = render_target.CreateSolidColorBrush(&BRUSH_COLOR, Some(&brush_property))?;
+            let brush = render_target.CreateSolidColorBrush(&BRUSH_COLOR, None)?;
             let subpixel_shift = params
                 .subpixel_variant
                 .map(|v| v as f32 / SUBPIXEL_VARIANTS as f32);
@@ -699,10 +712,17 @@ impl DirectWriteState {
             // This `cast()` action here should never fail since we are running on Win10+, and
             // ID2D1DeviceContext4 requires Win8+
             let render_target = render_target.cast::<ID2D1DeviceContext4>().unwrap();
+            render_target.SetUnitMode(D2D1_UNIT_MODE_DIPS);
+            render_target.SetDpi(
+                bitmap_dpi * params.scale_factor,
+                bitmap_dpi * params.scale_factor,
+            );
+            render_target.SetTextRenderingParams(&self.components.render_context.params);
             render_target.BeginDraw();
+
             if params.is_emoji {
                 // WARN: only DWRITE_GLYPH_IMAGE_FORMATS_COLR has been tested
-                let enumerator = self.components.factory.TranslateColorGlyphRun2(
+                let enumerator = self.components.factory.TranslateColorGlyphRun(
                     baseline_origin,
                     &glyph_run as _,
                     None,
@@ -712,11 +732,11 @@ impl DirectWriteState {
                         | DWRITE_GLYPH_IMAGE_FORMATS_JPEG
                         | DWRITE_GLYPH_IMAGE_FORMATS_PREMULTIPLIED_B8G8R8A8,
                     DWRITE_MEASURING_MODE_NATURAL,
-                    Some(&transform as _),
+                    None,
                     0,
                 )?;
                 while enumerator.MoveNext().is_ok() {
-                    let Ok(color_glyph) = enumerator.GetCurrentRun2() else {
+                    let Ok(color_glyph) = enumerator.GetCurrentRun() else {
                         break;
                     };
                     let color_glyph = &*color_glyph;
@@ -741,7 +761,7 @@ impl DirectWriteState {
                             color_glyph.Base.paletteIndex as u32,
                             color_glyph.measuringMode,
                         ),
-                        _ => render_target.DrawGlyphRun2(
+                        _ => render_target.DrawGlyphRun(
                             baseline_origin,
                             &color_glyph.Base.glyphRun,
                             Some(color_glyph.Base.glyphRunDescription as *const _),
@@ -754,14 +774,16 @@ impl DirectWriteState {
                 render_target.DrawGlyphRun(
                     baseline_origin,
                     &glyph_run,
+                    None,
                     &brush,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
             }
             render_target.EndDraw(None, None)?;
+
             let mut raw_data = vec![0u8; total_bytes];
-            bitmap.CopyPixels(std::ptr::null() as _, bitmap_stride, &mut raw_data)?;
             if params.is_emoji {
+                bitmap.CopyPixels(std::ptr::null() as _, bitmap_stride, &mut raw_data)?;
                 // Convert from BGRA with premultiplied alpha to BGRA with straight alpha.
                 for pixel in raw_data.chunks_exact_mut(4) {
                     let a = pixel[3] as f32 / 255.;
@@ -769,6 +791,15 @@ impl DirectWriteState {
                     pixel[1] = (pixel[1] as f32 / a) as u8;
                     pixel[2] = (pixel[2] as f32 / a) as u8;
                 }
+            } else {
+                let scaler = self.components.bitmap_factory.CreateBitmapScaler()?;
+                scaler.Initialize(
+                    &bitmap,
+                    bitmap_size.width.0 as u32,
+                    bitmap_size.height.0 as u32,
+                    WICBitmapInterpolationModeHighQualityCubic,
+                )?;
+                scaler.CopyPixels(std::ptr::null() as _, bitmap_stride, &mut raw_data)?;
             }
             Ok((bitmap_size, raw_data))
         }
@@ -945,8 +976,8 @@ impl IDWriteTextRenderer_Impl for TextRenderer {
             // This `cast()` action here should never fail since we are running on Win10+, and
             // `IDWriteFontFace3` requires Win10
             let font_face = &font_face.cast::<IDWriteFontFace3>().unwrap();
-            let Some((postscript_name, font_struct, is_emoji)) =
-                get_postscript_name_and_font(font_face, &self.locale)
+            let Some((font_identifier, font_struct, is_emoji)) =
+                get_font_identifier_and_font_struct(font_face, &self.locale)
             else {
                 log::error!("none postscript name found");
                 return Ok(());
@@ -954,8 +985,8 @@ impl IDWriteTextRenderer_Impl for TextRenderer {
 
             let font_id = if let Some(id) = context
                 .text_system
-                .font_id_by_postscript_name
-                .get(&postscript_name)
+                .font_id_by_identifier
+                .get(&font_identifier)
             {
                 *id
             } else {
@@ -1121,39 +1152,60 @@ fn get_font_names_from_collection(
     }
 }
 
-unsafe fn get_postscript_name_and_font(
+fn get_font_identifier_and_font_struct(
     font_face: &IDWriteFontFace3,
     locale: &str,
-) -> Option<(String, Font, bool)> {
+) -> Option<(FontIdentifier, Font, bool)> {
     let Some(postscript_name) = get_postscript_name(font_face, locale) else {
         return None;
     };
-    let Some(localized_family_name) = font_face.GetFamilyNames().log_err() else {
+    let Some(localized_family_name) = (unsafe { font_face.GetFamilyNames().log_err() }) else {
         return None;
     };
     let Some(family_name) = get_name(localized_family_name, locale) else {
         return None;
     };
+    let weight = unsafe { font_face.GetWeight() };
+    let style = unsafe { font_face.GetStyle() };
+    let identifier = FontIdentifier {
+        postscript_name,
+        weight: weight.0,
+        style: style.0,
+    };
     let font_struct = Font {
         family: family_name.into(),
         features: FontFeatures::default(),
-        weight: font_face.GetWeight().into(),
-        style: font_face.GetStyle().into(),
+        weight: weight.into(),
+        style: style.into(),
     };
-    let is_emoji = font_face.IsColorFont().as_bool();
-    Some((postscript_name, font_struct, is_emoji))
+    let is_emoji = unsafe { font_face.IsColorFont().as_bool() };
+    Some((identifier, font_struct, is_emoji))
 }
 
-unsafe fn get_postscript_name(font_face: &IDWriteFontFace3, locale: &str) -> Option<String> {
-    let mut info = std::mem::zeroed();
+#[inline]
+fn get_font_identifier(font_face: &IDWriteFontFace3, locale: &str) -> Option<FontIdentifier> {
+    let weight = unsafe { font_face.GetWeight().0 };
+    let style = unsafe { font_face.GetStyle().0 };
+    get_postscript_name(font_face, locale).map(|postscript_name| FontIdentifier {
+        postscript_name,
+        weight,
+        style,
+    })
+}
+
+#[inline]
+fn get_postscript_name(font_face: &IDWriteFontFace3, locale: &str) -> Option<String> {
+    let mut info = None;
     let mut exists = BOOL(0);
-    font_face
-        .GetInformationalStrings(
-            DWRITE_INFORMATIONAL_STRING_POSTSCRIPT_NAME,
-            &mut info,
-            &mut exists,
-        )
-        .log_err();
+    unsafe {
+        font_face
+            .GetInformationalStrings(
+                DWRITE_INFORMATIONAL_STRING_POSTSCRIPT_NAME,
+                &mut info,
+                &mut exists,
+            )
+            .log_err();
+    }
     if !exists.as_bool() || info.is_none() {
         return None;
     }
@@ -1162,7 +1214,7 @@ unsafe fn get_postscript_name(font_face: &IDWriteFontFace3, locale: &str) -> Opt
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/api/dwrite/ne-dwrite-dwrite_font_feature_tag
-unsafe fn apply_font_features(
+fn apply_font_features(
     direct_write_features: &IDWriteTypography,
     features: &FontFeatures,
 ) -> Result<()> {
@@ -1173,53 +1225,50 @@ unsafe fn apply_font_features(
 
     // All of these features are enabled by default by DirectWrite.
     // If you want to (and can) peek into the source of DirectWrite
-    let mut feature_liga = make_direct_write_feature("liga", true);
-    let mut feature_clig = make_direct_write_feature("clig", true);
-    let mut feature_calt = make_direct_write_feature("calt", true);
+    let mut feature_liga = make_direct_write_feature("liga", 1);
+    let mut feature_clig = make_direct_write_feature("clig", 1);
+    let mut feature_calt = make_direct_write_feature("calt", 1);
 
-    for (tag, enable) in tag_values {
-        if tag == *"liga" && !enable {
+    for (tag, value) in tag_values {
+        if tag.as_str() == "liga" && *value == 0 {
             feature_liga.parameter = 0;
             continue;
         }
-        if tag == *"clig" && !enable {
+        if tag.as_str() == "clig" && *value == 0 {
             feature_clig.parameter = 0;
             continue;
         }
-        if tag == *"calt" && !enable {
+        if tag.as_str() == "calt" && *value == 0 {
             feature_calt.parameter = 0;
             continue;
         }
 
-        direct_write_features.AddFontFeature(make_direct_write_feature(&tag, enable))?;
+        unsafe {
+            direct_write_features.AddFontFeature(make_direct_write_feature(&tag, *value))?;
+        }
     }
-    direct_write_features.AddFontFeature(feature_liga)?;
-    direct_write_features.AddFontFeature(feature_clig)?;
-    direct_write_features.AddFontFeature(feature_calt)?;
+    unsafe {
+        direct_write_features.AddFontFeature(feature_liga)?;
+        direct_write_features.AddFontFeature(feature_clig)?;
+        direct_write_features.AddFontFeature(feature_calt)?;
+    }
 
     Ok(())
 }
 
 #[inline]
-fn make_direct_write_feature(feature_name: &str, enable: bool) -> DWRITE_FONT_FEATURE {
+fn make_direct_write_feature(feature_name: &str, parameter: u32) -> DWRITE_FONT_FEATURE {
     let tag = make_direct_write_tag(feature_name);
-    if enable {
-        DWRITE_FONT_FEATURE {
-            nameTag: tag,
-            parameter: 1,
-        }
-    } else {
-        DWRITE_FONT_FEATURE {
-            nameTag: tag,
-            parameter: 0,
-        }
+    DWRITE_FONT_FEATURE {
+        nameTag: tag,
+        parameter,
     }
 }
 
 #[inline]
 fn make_open_type_tag(tag_name: &str) -> u32 {
-    assert_eq!(tag_name.chars().count(), 4);
     let bytes = tag_name.bytes().collect_vec();
+    assert_eq!(bytes.len(), 4);
     ((bytes[3] as u32) << 24)
         | ((bytes[2] as u32) << 16)
         | ((bytes[1] as u32) << 8)
@@ -1231,32 +1280,39 @@ fn make_direct_write_tag(tag_name: &str) -> DWRITE_FONT_FEATURE_TAG {
     DWRITE_FONT_FEATURE_TAG(make_open_type_tag(tag_name))
 }
 
-unsafe fn get_name(string: IDWriteLocalizedStrings, locale: &str) -> Option<String> {
+#[inline]
+fn get_name(string: IDWriteLocalizedStrings, locale: &str) -> Option<String> {
     let mut locale_name_index = 0u32;
     let mut exists = BOOL(0);
-    string
-        .FindLocaleName(
-            &HSTRING::from(locale),
-            &mut locale_name_index,
-            &mut exists as _,
-        )
-        .log_err();
-    if !exists.as_bool() {
+    unsafe {
         string
             .FindLocaleName(
-                DEFAULT_LOCALE_NAME,
-                &mut locale_name_index as _,
+                &HSTRING::from(locale),
+                &mut locale_name_index,
                 &mut exists as _,
             )
             .log_err();
+    }
+    if !exists.as_bool() {
+        unsafe {
+            string
+                .FindLocaleName(
+                    DEFAULT_LOCALE_NAME,
+                    &mut locale_name_index as _,
+                    &mut exists as _,
+                )
+                .log_err();
+        }
         if !exists.as_bool() {
             return None;
         }
     }
 
-    let name_length = string.GetStringLength(locale_name_index).unwrap() as usize;
+    let name_length = unsafe { string.GetStringLength(locale_name_index).unwrap() } as usize;
     let mut name_vec = vec![0u16; name_length + 1];
-    string.GetString(locale_name_index, &mut name_vec).unwrap();
+    unsafe {
+        string.GetString(locale_name_index, &mut name_vec).unwrap();
+    }
 
     Some(String::from_utf16_lossy(&name_vec[..name_length]))
 }
@@ -1287,10 +1343,29 @@ fn get_system_ui_font_name() -> SharedString {
             // Segoe UI is the Windows font intended for user interface text strings.
             "Segoe UI".into()
         } else {
-            String::from_utf16_lossy(&info.lfFaceName).into()
+            let font_name = String::from_utf16_lossy(&info.lfFaceName);
+            font_name.trim_matches(char::from(0)).to_owned().into()
         };
         log::info!("Use {} as UI font.", font_family);
         font_family
+    }
+}
+
+#[inline]
+fn get_render_target_property(
+    pixel_format: DXGI_FORMAT,
+    alpha_mode: D2D1_ALPHA_MODE,
+) -> D2D1_RENDER_TARGET_PROPERTIES {
+    D2D1_RENDER_TARGET_PROPERTIES {
+        r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: pixel_format,
+            alphaMode: alpha_mode,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        usage: D2D1_RENDER_TARGET_USAGE_NONE,
+        minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
     }
 }
 

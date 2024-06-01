@@ -32,7 +32,7 @@ use gpui::{
     ElementId, Entity as _, EntityId, EventEmitter, FocusHandle, FocusableView, Global,
     GlobalElementId, KeyContext, Keystroke, LayoutId, ManagedView, Model, ModelContext,
     PathPromptOptions, Point, PromptLevel, Render, Size, Subscription, Task, View, WeakView,
-    WindowHandle, WindowOptions,
+    WindowBounds, WindowHandle, WindowOptions,
 };
 use item::{
     FollowableItem, FollowableItemHandle, Item, ItemHandle, ItemSettings, PreviewTabsSettings,
@@ -46,7 +46,7 @@ use node_runtime::NodeRuntime;
 use notifications::{simple_message_notification::MessageNotification, NotificationHandle};
 pub use pane::*;
 pub use pane_group::*;
-use persistence::{model::SerializedWorkspace, SerializedWindowsBounds, DB};
+use persistence::{model::SerializedWorkspace, SerializedWindowBounds, DB};
 pub use persistence::{
     model::{ItemId, LocalPaths, SerializedDevServerProject, SerializedWorkspaceLocation},
     WorkspaceDb, DB as WORKSPACE_DB,
@@ -90,11 +90,11 @@ pub use workspace_settings::{
     AutosaveSetting, RestoreOnStartupBehaviour, TabBarSettings, WorkspaceSettings,
 };
 
-use crate::notifications::NotificationId;
 use crate::persistence::{
     model::{DockData, DockStructure, SerializedItem, SerializedPane, SerializedPaneGroup},
     SerializedAxis,
 };
+use crate::{notifications::NotificationId, persistence::model::LocalPathsOrder};
 
 lazy_static! {
     static ref ZED_WINDOW_SIZE: Option<Size<DevicePixels>> = env::var("ZED_WINDOW_SIZE")
@@ -130,7 +130,6 @@ actions!(
         NewCenterTerminal,
         NewSearch,
         Feedback,
-        Restart,
         Welcome,
         ToggleZoom,
         ToggleLeftDock,
@@ -185,6 +184,11 @@ pub struct CloseInactiveTabsAndPanes {
 #[derive(Clone, Deserialize, PartialEq)]
 pub struct SendKeystrokes(pub String);
 
+#[derive(Clone, Deserialize, PartialEq, Default)]
+pub struct Restart {
+    pub binary_path: Option<PathBuf>,
+}
+
 impl_actions!(
     workspace,
     [
@@ -194,6 +198,7 @@ impl_actions!(
         CloseInactiveTabsAndPanes,
         NewFileInDirection,
         OpenTerminal,
+        Restart,
         Save,
         SaveAll,
         SwapPaneInDirection,
@@ -458,7 +463,7 @@ impl AppState {
         let fs = fs::FakeFs::new(cx.background_executor().clone());
         let languages = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
         let clock = Arc::new(clock::FakeSystemClock::default());
-        let http_client = util::http::FakeHttpClient::with_404_response();
+        let http_client = http::FakeHttpClient::with_404_response();
         let client = Client::new(clock, http_client.clone(), cx);
         let user_store = cx.new_model(|cx| UserStore::new(client.clone(), cx));
         let workspace_store = cx.new_model(|cx| WorkspaceStore::new(client.clone(), cx));
@@ -527,6 +532,9 @@ impl DelayedDebouncedEditAction {
 
 pub enum Event {
     PaneAdded(View<Pane>),
+    PaneRemoved,
+    ItemAdded,
+    ItemRemoved,
     ActiveItemChanged,
     ContactRequestedJoin(u64),
     WorkspaceCreated(WeakView<Workspace>),
@@ -580,7 +588,7 @@ pub struct Workspace {
     window_edited: bool,
     active_call: Option<(Model<ActiveCall>, Vec<Subscription>)>,
     leader_updates_tx: mpsc::UnboundedSender<(PeerId, proto::UpdateFollowers)>,
-    database_id: WorkspaceId,
+    database_id: Option<WorkspaceId>,
     app_state: Arc<AppState>,
     dispatching_keystrokes: Rc<RefCell<Vec<Keystroke>>>,
     _subscriptions: Vec<Subscription>,
@@ -614,7 +622,7 @@ impl Workspace {
     const MAX_PADDING: f32 = 0.4;
 
     pub fn new(
-        workspace_id: WorkspaceId,
+        workspace_id: Option<WorkspaceId>,
         project: Model<Project>,
         app_state: Arc<AppState>,
         cx: &mut ViewContext<Self>,
@@ -785,25 +793,13 @@ impl Workspace {
                         .await;
                     this.update(&mut cx, |this, cx| {
                         if let Some(display) = cx.display() {
-                            let window_bounds = cx.window_bounds();
-                            let fullscreen = cx.is_fullscreen();
-
                             if let Some(display_uuid) = display.uuid().log_err() {
-                                // Only update the window bounds when not full screen,
-                                // so we can remember the last non-fullscreen bounds
-                                // across restarts
-                                if fullscreen {
+                                let window_bounds = cx.window_bounds();
+                                if let Some(database_id) = workspace_id {
                                     cx.background_executor()
-                                        .spawn(DB.set_fullscreen(workspace_id, true))
-                                        .detach_and_log_err(cx);
-                                } else if !cx.is_minimized() {
-                                    cx.background_executor()
-                                        .spawn(DB.set_fullscreen(workspace_id, false))
-                                        .detach_and_log_err(cx);
-                                    cx.background_executor()
-                                        .spawn(DB.set_window_bounds(
-                                            workspace_id,
-                                            SerializedWindowsBounds(window_bounds),
+                                        .spawn(DB.set_window_open_status(
+                                            database_id,
+                                            SerializedWindowBounds(window_bounds),
                                             display_uuid,
                                         ))
                                         .detach_and_log_err(cx);
@@ -910,13 +906,35 @@ impl Workspace {
             let serialized_workspace: Option<SerializedWorkspace> =
                 persistence::DB.workspace_for_roots(abs_paths.as_slice());
 
-            let paths_to_open = Arc::new(abs_paths);
+            let mut paths_to_open = abs_paths;
+
+            let paths_order = serialized_workspace
+                .as_ref()
+                .map(|ws| &ws.location)
+                .and_then(|loc| match loc {
+                    SerializedWorkspaceLocation::Local(_, order) => Some(order.order()),
+                    _ => None,
+                });
+
+            if let Some(paths_order) = paths_order {
+                paths_to_open = paths_order
+                    .iter()
+                    .filter_map(|i| paths_to_open.get(*i).cloned())
+                    .collect::<Vec<_>>();
+                if paths_order.iter().enumerate().any(|(i, &j)| i != j) {
+                    project_handle
+                        .update(&mut cx, |project, _| {
+                            project.set_worktrees_reordered(true);
+                        })
+                        .log_err();
+                }
+            }
 
             // Get project paths for all of the abs_paths
             let mut worktree_roots: HashSet<Arc<Path>> = Default::default();
             let mut project_paths: Vec<(PathBuf, Option<ProjectPath>)> =
                 Vec::with_capacity(paths_to_open.len());
-            for path in paths_to_open.iter().cloned() {
+            for path in paths_to_open.into_iter() {
                 if let Some((worktree, project_entry)) = cx
                     .update(|cx| {
                         Workspace::project_path_for_path(project_handle.clone(), &path, true, cx)
@@ -940,37 +958,39 @@ impl Workspace {
             let window = if let Some(window) = requesting_window {
                 cx.update_window(window.into(), |_, cx| {
                     cx.replace_root_view(|cx| {
-                        Workspace::new(workspace_id, project_handle.clone(), app_state.clone(), cx)
+                        Workspace::new(
+                            Some(workspace_id),
+                            project_handle.clone(),
+                            app_state.clone(),
+                            cx,
+                        )
                     });
                 })?;
                 window
             } else {
                 let window_bounds_override = window_bounds_env_override();
 
-                let (bounds, display, fullscreen) = if let Some(bounds) = window_bounds_override {
-                    (Some(bounds), None, false)
+                let (window_bounds, display) = if let Some(bounds) = window_bounds_override {
+                    (Some(WindowBounds::Windowed(bounds)), None)
                 } else {
                     let restorable_bounds = serialized_workspace
                         .as_ref()
-                        .and_then(|workspace| {
-                            Some((workspace.display?, workspace.bounds?, workspace.fullscreen))
-                        })
+                        .and_then(|workspace| Some((workspace.display?, workspace.window_bounds?)))
                         .or_else(|| {
-                            let (display, bounds, fullscreen) = DB.last_window().log_err()?;
-                            Some((display?, bounds?.0, fullscreen.unwrap_or(false)))
+                            let (display, window_bounds) = DB.last_window().log_err()?;
+                            Some((display?, window_bounds?))
                         });
 
-                    if let Some((serialized_display, bounds, fullscreen)) = restorable_bounds {
-                        (Some(bounds), Some(serialized_display), fullscreen)
+                    if let Some((serialized_display, serialized_status)) = restorable_bounds {
+                        (Some(serialized_status.0), Some(serialized_display))
                     } else {
-                        (None, None, false)
+                        (None, None)
                     }
                 };
 
                 // Use the serialized workspace to construct the new window
                 let mut options = cx.update(|cx| (app_state.build_window_options)(display, cx))?;
-                options.bounds = bounds;
-                options.fullscreen = fullscreen;
+                options.window_bounds = window_bounds;
                 let centered_layout = serialized_workspace
                     .as_ref()
                     .map(|w| w.centered_layout)
@@ -981,7 +1001,7 @@ impl Workspace {
                     move |cx| {
                         cx.new_view(|cx| {
                             let mut workspace =
-                                Workspace::new(workspace_id, project_handle, app_state, cx);
+                                Workspace::new(Some(workspace_id), project_handle, app_state, cx);
                             workspace.centered_layout = centered_layout;
                             workspace
                         })
@@ -2511,6 +2531,9 @@ impl Workspace {
         self.zoomed_position = None;
         cx.emit(Event::ZoomChanged);
         self.update_active_view_for_followers(cx);
+        pane.model.update(cx, |pane, _| {
+            pane.track_alternate_file_items();
+        });
 
         cx.notify();
     }
@@ -2522,12 +2545,18 @@ impl Workspace {
         cx: &mut ViewContext<Self>,
     ) {
         match event {
-            pane::Event::AddItem { item } => item.added_to_pane(self, pane, cx),
+            pane::Event::AddItem { item } => {
+                item.added_to_pane(self, pane, cx);
+                cx.emit(Event::ItemAdded);
+            }
             pane::Event::Split(direction) => {
                 self.split_and_clone(pane, *direction, cx);
             }
             pane::Event::Remove => self.remove_pane(pane, cx),
             pane::Event::ActivateItem { local } => {
+                pane.model.update(cx, |pane, _| {
+                    pane.track_alternate_file_items();
+                });
                 if *local {
                     self.unfollow(&pane, cx);
                 }
@@ -2702,6 +2731,7 @@ impl Workspace {
         } else {
             self.active_item_path_changed(cx);
         }
+        cx.emit(Event::PaneRemoved);
     }
 
     pub fn panes(&self) -> &[View<Pane>] {
@@ -3441,9 +3471,12 @@ impl Workspace {
     pub fn on_window_activation_changed(&mut self, cx: &mut ViewContext<Self>) {
         if cx.is_window_active() {
             self.update_active_view_for_followers(cx);
-            cx.background_executor()
-                .spawn(persistence::DB.update_timestamp(self.database_id()))
-                .detach();
+
+            if let Some(database_id) = self.database_id {
+                cx.background_executor()
+                    .spawn(persistence::DB.update_timestamp(database_id))
+                    .detach();
+            }
         } else {
             for pane in &self.panes {
                 pane.update(cx, |pane, cx| {
@@ -3483,20 +3516,20 @@ impl Workspace {
         }
     }
 
-    pub fn database_id(&self) -> WorkspaceId {
+    pub fn database_id(&self) -> Option<WorkspaceId> {
         self.database_id
     }
 
-    fn local_paths(&self, cx: &AppContext) -> Option<LocalPaths> {
+    fn local_paths(&self, cx: &AppContext) -> Option<Vec<Arc<Path>>> {
         let project = self.project().read(cx);
 
         if project.is_local() {
-            Some(LocalPaths::new(
+            Some(
                 project
                     .visible_worktrees(cx)
                     .map(|worktree| worktree.read(cx).abs_path())
                     .collect::<Vec<_>>(),
-            ))
+            )
         } else {
             None
         }
@@ -3543,6 +3576,10 @@ impl Workspace {
     }
 
     fn serialize_workspace_internal(&self, cx: &mut WindowContext) -> Task<()> {
+        let Some(database_id) = self.database_id() else {
+            return Task::ready(());
+        };
+
         fn serialize_pane_handle(pane_handle: &View<Pane>, cx: &WindowContext) -> SerializedPane {
             let (items, active) = {
                 let pane = pane_handle.read(cx);
@@ -3640,8 +3677,17 @@ impl Workspace {
         }
 
         let location = if let Some(local_paths) = self.local_paths(cx) {
-            if !local_paths.paths().is_empty() {
-                Some(SerializedWorkspaceLocation::Local(local_paths))
+            if !local_paths.is_empty() {
+                let (order, paths): (Vec<_>, Vec<_>) = local_paths
+                    .iter()
+                    .enumerate()
+                    .sorted_by(|a, b| a.1.cmp(b.1))
+                    .unzip();
+
+                Some(SerializedWorkspaceLocation::Local(
+                    LocalPaths::new(paths),
+                    LocalPathsOrder::new(order),
+                ))
             } else {
                 None
             }
@@ -3667,14 +3713,14 @@ impl Workspace {
         if let Some(location) = location {
             let center_group = build_serialized_pane_group(&self.center.root, cx);
             let docks = build_serialized_docks(self, cx);
+            let window_bounds = Some(SerializedWindowBounds(cx.window_bounds()));
             let serialized_workspace = SerializedWorkspace {
-                id: self.database_id,
+                id: database_id,
                 location,
                 center_group,
-                bounds: Default::default(),
+                window_bounds,
                 display: Default::default(),
                 docks,
-                fullscreen: cx.is_fullscreen(),
                 centered_layout: self.centered_layout,
             };
             return cx.spawn(|_| persistence::DB.save_workspace(serialized_workspace));
@@ -3912,9 +3958,11 @@ impl Workspace {
 
     pub fn toggle_centered_layout(&mut self, _: &ToggleCenteredLayout, cx: &mut ViewContext<Self>) {
         self.centered_layout = !self.centered_layout;
-        cx.background_executor()
-            .spawn(DB.set_centered_layout(self.database_id, self.centered_layout))
-            .detach_and_log_err(cx);
+        if let Some(database_id) = self.database_id() {
+            cx.background_executor()
+                .spawn(DB.set_centered_layout(database_id, self.centered_layout))
+                .detach_and_log_err(cx);
+        }
         cx.notify();
     }
 
@@ -4091,10 +4139,7 @@ impl Render for Workspace {
         };
         let (ui_font, ui_font_size) = {
             let theme_settings = ThemeSettings::get_global(cx);
-            (
-                theme_settings.ui_font.family.clone(),
-                theme_settings.ui_font_size,
-            )
+            (theme_settings.ui_font.clone(), theme_settings.ui_font_size)
         };
 
         let theme = cx.theme().clone();
@@ -4107,7 +4152,7 @@ impl Render for Workspace {
             .size_full()
             .flex()
             .flex_col()
-            .font_family(ui_font)
+            .font(ui_font)
             .gap_0()
             .justify_start()
             .items_start()
@@ -4531,15 +4576,19 @@ async fn join_channel_internal(
         if let Some((project, host)) = room.most_active_project(cx) {
             return Some(join_in_room_project(project, host, app_state.clone(), cx));
         }
-        // if you are the first to join a channel, share your project
-        if room.remote_participants().len() == 0 && !room.local_participant_is_guest() {
+
+        // If you are the first to join a channel, see if you should share your project.
+        if room.remote_participants().is_empty() && !room.local_participant_is_guest() {
             if let Some(workspace) = requesting_window {
                 let project = workspace.update(cx, |workspace, cx| {
-                    if !CallSettings::get_global(cx).share_on_join {
+                    let project = workspace.project.read(cx);
+                    let is_dev_server = project.dev_server_project_id().is_some();
+
+                    if !is_dev_server && !CallSettings::get_global(cx).share_on_join {
                         return None;
                     }
-                    let project = workspace.project.read(cx);
-                    if (project.is_local() || project.dev_server_project_id().is_some())
+
+                    if (project.is_local() || is_dev_server)
                         && project.visible_worktrees(cx).any(|tree| {
                             tree.read(cx)
                                 .root_entry()
@@ -4867,7 +4916,8 @@ pub fn join_hosted_project(
             let window_bounds_override = window_bounds_env_override();
             cx.update(|cx| {
                 let mut options = (app_state.build_window_options)(None, cx);
-                options.bounds = window_bounds_override;
+                options.window_bounds =
+                    window_bounds_override.map(|bounds| WindowBounds::Windowed(bounds));
                 cx.open_window(options, |cx| {
                     cx.new_view(|cx| {
                         Workspace::new(Default::default(), project, app_state.clone(), cx)
@@ -4931,7 +4981,8 @@ pub fn join_dev_server_project(
                 let window_bounds_override = window_bounds_env_override();
                 cx.update(|cx| {
                     let mut options = (app_state.build_window_options)(None, cx);
-                    options.bounds = window_bounds_override;
+                    options.window_bounds =
+                        window_bounds_override.map(|bounds| WindowBounds::Windowed(bounds));
                     cx.open_window(options, |cx| {
                         cx.new_view(|cx| {
                             Workspace::new(Default::default(), project, app_state.clone(), cx)
@@ -4993,7 +5044,8 @@ pub fn join_in_room_project(
             let window_bounds_override = window_bounds_env_override();
             cx.update(|cx| {
                 let mut options = (app_state.build_window_options)(None, cx);
-                options.bounds = window_bounds_override;
+                options.window_bounds =
+                    window_bounds_override.map(|bounds| WindowBounds::Windowed(bounds));
                 cx.open_window(options, |cx| {
                     cx.new_view(|cx| {
                         Workspace::new(Default::default(), project, app_state.clone(), cx)
@@ -5034,7 +5086,7 @@ pub fn join_in_room_project(
     })
 }
 
-pub fn restart(_: &Restart, cx: &mut AppContext) {
+pub fn restart(restart: &Restart, cx: &mut AppContext) {
     let should_confirm = WorkspaceSettings::get_global(cx).confirm_quit;
     let mut workspace_windows = cx
         .windows()
@@ -5060,6 +5112,7 @@ pub fn restart(_: &Restart, cx: &mut AppContext) {
             .ok();
     }
 
+    let binary_path = restart.binary_path.clone();
     cx.spawn(|mut cx| async move {
         if let Some(prompt) = prompt {
             let answer = prompt.await?;
@@ -5079,7 +5132,7 @@ pub fn restart(_: &Restart, cx: &mut AppContext) {
             }
         }
 
-        cx.update(|cx| cx.restart())
+        cx.update(|cx| cx.restart(binary_path))
     })
     .detach_and_log_err(cx);
 }
@@ -5178,8 +5231,8 @@ mod tests {
     };
     use fs::FakeFs;
     use gpui::{
-        px, BorrowAppContext, DismissEvent, Empty, EventEmitter, FocusHandle, FocusableView,
-        Render, TestAppContext, VisualTestContext,
+        px, DismissEvent, Empty, EventEmitter, FocusHandle, FocusableView, Render, TestAppContext,
+        UpdateGlobal, VisualTestContext,
     };
     use project::{Project, ProjectEntryId};
     use serde_json::json;
@@ -5315,7 +5368,7 @@ mod tests {
         // Add a project folder
         project
             .update(cx, |project, cx| {
-                project.find_or_create_local_worktree("/root2", true, cx)
+                project.find_or_create_local_worktree("root2", true, cx)
             })
             .await
             .unwrap();
@@ -5601,7 +5654,7 @@ mod tests {
 
         // Autosave on window change.
         item.update(cx, |item, cx| {
-            cx.update_global(|settings: &mut SettingsStore, cx| {
+            SettingsStore::update_global(cx, |settings, cx| {
                 settings.update_user_settings::<WorkspaceSettings>(cx, |settings| {
                     settings.autosave = Some(AutosaveSetting::OnWindowChange);
                 })
@@ -5621,7 +5674,7 @@ mod tests {
         // Autosave on focus change.
         item.update(cx, |item, cx| {
             cx.focus_self();
-            cx.update_global(|settings: &mut SettingsStore, cx| {
+            SettingsStore::update_global(cx, |settings, cx| {
                 settings.update_user_settings::<WorkspaceSettings>(cx, |settings| {
                     settings.autosave = Some(AutosaveSetting::OnFocusChange);
                 })
@@ -5644,7 +5697,7 @@ mod tests {
 
         // Autosave after delay.
         item.update(cx, |item, cx| {
-            cx.update_global(|settings: &mut SettingsStore, cx| {
+            SettingsStore::update_global(cx, |settings, cx| {
                 settings.update_user_settings::<WorkspaceSettings>(cx, |settings| {
                     settings.autosave = Some(AutosaveSetting::AfterDelay { milliseconds: 500 });
                 })
@@ -5663,7 +5716,7 @@ mod tests {
 
         // Autosave on focus change, ensuring closing the tab counts as such.
         item.update(cx, |item, cx| {
-            cx.update_global(|settings: &mut SettingsStore, cx| {
+            SettingsStore::update_global(cx, |settings, cx| {
                 settings.update_user_settings::<WorkspaceSettings>(cx, |settings| {
                     settings.autosave = Some(AutosaveSetting::OnFocusChange);
                 })

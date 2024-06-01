@@ -41,7 +41,7 @@ pub struct MovePageDown {
 #[derive(PartialEq, Clone, Deserialize, Default)]
 pub struct MoveToEndOfLine {
     #[serde(default = "default_true")]
-    pub(super) stop_at_soft_wraps: bool,
+    pub stop_at_soft_wraps: bool,
 }
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
@@ -52,14 +52,9 @@ pub struct SelectToEndOfLine {
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
 pub struct ToggleCodeActions {
+    // Display row from which the action was deployed.
     #[serde(default)]
-    pub deployed_from_indicator: Option<u32>,
-}
-
-#[derive(PartialEq, Clone, Deserialize, Default)]
-pub struct ToggleTestRunner {
-    #[serde(default)]
-    pub deployed_from_row: Option<u32>,
+    pub deployed_from_indicator: Option<DisplayRow>,
 }
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
@@ -82,12 +77,12 @@ pub struct ToggleComments {
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
 pub struct FoldAt {
-    pub buffer_row: u32,
+    pub buffer_row: MultiBufferRow,
 }
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
 pub struct UnfoldAt {
-    pub buffer_row: u32,
+    pub buffer_row: MultiBufferRow,
 }
 
 #[derive(PartialEq, Clone, Deserialize, Default)]
@@ -119,12 +114,26 @@ pub struct ExpandExcerpts {
     pub(super) lines: u32,
 }
 
+#[derive(PartialEq, Clone, Deserialize, Default)]
+pub struct ExpandExcerptsUp {
+    #[serde(default)]
+    pub(super) lines: u32,
+}
+
+#[derive(PartialEq, Clone, Deserialize, Default)]
+pub struct ExpandExcerptsDown {
+    #[serde(default)]
+    pub(super) lines: u32,
+}
+
 impl_actions!(
     editor,
     [
         ConfirmCodeAction,
         ConfirmCompletion,
         ExpandExcerpts,
+        ExpandExcerptsUp,
+        ExpandExcerptsDown,
         FoldAt,
         MoveDownByLines,
         MovePageDown,
@@ -148,6 +157,7 @@ gpui::actions!(
     editor,
     [
         AcceptPartialCopilotSuggestion,
+        AcceptInlineCompletion,
         AcceptPartialInlineCompletion,
         AddSelectionAbove,
         AddSelectionBelow,
@@ -277,6 +287,7 @@ gpui::actions!(
         ToggleHunkDiff,
         ToggleInlayHints,
         ToggleLineNumbers,
+        ToggleIndentGuides,
         ToggleSoftWrap,
         Transpose,
         Undo,

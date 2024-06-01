@@ -66,6 +66,16 @@ impl Database {
                     .await?
                     .ok_or_else(|| anyhow!("no remote project"))?;
 
+                let (_, dev_server) = dev_server_project::Entity::find_by_id(dev_server_project_id)
+                    .find_also_related(dev_server::Entity)
+                    .one(&*tx)
+                    .await?
+                    .ok_or_else(|| anyhow!("no dev_server_project"))?;
+
+                if !dev_server.is_some_and(|dev_server| dev_server.user_id == participant.user_id) {
+                    return Err(anyhow!("not your dev server"))?;
+                }
+
                 if project.room_id.is_some() {
                     return Err(anyhow!("project already shared"))?;
                 };
@@ -77,7 +87,6 @@ impl Database {
                 .exec(&*tx)
                 .await?;
 
-                // todo! check user is a project-collaborator
                 let room = self.get_room(room_id, &tx).await?;
                 return Ok((project.id, room));
             }
@@ -130,13 +139,21 @@ impl Database {
         .await
     }
 
+    pub async fn delete_project(&self, project_id: ProjectId) -> Result<()> {
+        self.weak_transaction(|tx| async move {
+            project::Entity::delete_by_id(project_id).exec(&*tx).await?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Unshares the given project.
     pub async fn unshare_project(
         &self,
         project_id: ProjectId,
         connection: ConnectionId,
         user_id: Option<UserId>,
-    ) -> Result<TransactionGuard<(Option<proto::Room>, Vec<ConnectionId>)>> {
+    ) -> Result<TransactionGuard<(bool, Option<proto::Room>, Vec<ConnectionId>)>> {
         self.project_transaction(project_id, |tx| async move {
             let guest_connection_ids = self.project_guest_connection_ids(project_id, &tx).await?;
             let project = project::Entity::find_by_id(project_id)
@@ -149,10 +166,7 @@ impl Database {
                 None
             };
             if project.host_connection()? == connection {
-                project::Entity::delete(project.into_active_model())
-                    .exec(&*tx)
-                    .await?;
-                return Ok((room, guest_connection_ids));
+                return Ok((true, room, guest_connection_ids));
             }
             if let Some(dev_server_project_id) = project.dev_server_project_id {
                 if let Some(user_id) = user_id {
@@ -169,7 +183,7 @@ impl Database {
                     })
                     .exec(&*tx)
                     .await?;
-                    return Ok((room, guest_connection_ids));
+                    return Ok((false, room, guest_connection_ids));
                 }
             }
 
@@ -1081,6 +1095,36 @@ impl Database {
                     &tx,
                 )
                 .await?;
+            project.host_connection()
+        })
+        .await
+        .map(|guard| guard.into_inner())
+    }
+
+    /// Returns the host connection for a request to join a shared project.
+    pub async fn host_for_owner_project_request(
+        &self,
+        project_id: ProjectId,
+        _connection_id: ConnectionId,
+        user_id: UserId,
+    ) -> Result<ConnectionId> {
+        self.project_transaction(project_id, |tx| async move {
+            let (project, dev_server_project) = project::Entity::find_by_id(project_id)
+                .find_also_related(dev_server_project::Entity)
+                .one(&*tx)
+                .await?
+                .ok_or_else(|| anyhow!("no such project"))?;
+
+            let Some(dev_server_project) = dev_server_project else {
+                return Err(anyhow!("not a dev server project"))?;
+            };
+            let dev_server = dev_server::Entity::find_by_id(dev_server_project.dev_server_id)
+                .one(&*tx)
+                .await?
+                .ok_or_else(|| anyhow!("no such dev server"))?;
+            if dev_server.user_id != user_id {
+                return Err(anyhow!("not your project"))?;
+            }
             project.host_connection()
         })
         .await
