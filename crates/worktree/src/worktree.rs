@@ -5,25 +5,23 @@ mod worktree_tests;
 
 use ::ignore::gitignore::{Gitignore, GitignoreBuilder};
 use anyhow::{anyhow, Context as _, Result};
-use client::{proto, Client};
 use clock::ReplicaId;
 use collections::{HashMap, HashSet, VecDeque};
-use fs::Fs;
-use fs::{copy_recursive, RemoveOptions};
-use futures::stream::select;
+use fs::{copy_recursive, Fs, RemoveOptions, Watcher};
 use futures::{
     channel::{
         mpsc::{self, UnboundedSender},
         oneshot,
     },
     select_biased,
+    stream::select,
     task::Poll,
     FutureExt as _, Stream, StreamExt,
 };
 use fuzzy::CharBag;
-use git::status::GitStatus;
 use git::{
     repository::{GitFileStatus, GitRepository, RepoPath},
+    status::GitStatus,
     DOT_GIT, GITIGNORE,
 };
 use gpui::{
@@ -32,21 +30,15 @@ use gpui::{
 };
 use ignore::IgnoreStack;
 use itertools::Itertools;
-use language::{
-    proto::{deserialize_version, serialize_line_ending, serialize_version},
-    Buffer, Capability, DiagnosticEntry, File as _, LineEnding, PointUtf16, Rope, Unclipped,
-};
-use lsp::{DiagnosticSeverity, LanguageServerId};
 use parking_lot::Mutex;
 use postage::{
     barrier,
     prelude::{Sink as _, Stream as _},
     watch,
 };
-use serde::Serialize;
+use rpc::proto;
 use settings::{Settings, SettingsLocation, SettingsStore};
 use smol::channel::{self, Sender};
-use std::time::Instant;
 use std::{
     any::Any,
     cmp::{self, Ordering},
@@ -62,10 +54,10 @@ use std::{
         atomic::{AtomicUsize, Ordering::SeqCst},
         Arc,
     },
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use sum_tree::{Bias, Edit, SeekTarget, SumTree, TreeMap, TreeSet};
-use text::BufferId;
+use text::{LineEnding, Rope};
 use util::{
     paths::{PathMatcher, HOME},
     ResultExt,
@@ -97,26 +89,25 @@ pub enum Worktree {
     Remote(RemoteWorktree),
 }
 
+/// An entry, created in the worktree.
+#[derive(Debug)]
+pub enum CreatedEntry {
+    /// Got created and indexed by the worktree, receiving a corresponding entry.
+    Included(Entry),
+    /// Got created, but not indexed due to falling under exclusion filters.
+    Excluded { abs_path: PathBuf },
+}
+
 pub struct LocalWorktree {
     snapshot: LocalSnapshot,
     scan_requests_tx: channel::Sender<ScanRequest>,
     path_prefixes_to_scan_tx: channel::Sender<Arc<Path>>,
     is_scanning: (watch::Sender<bool>, watch::Receiver<bool>),
     _background_scanner_tasks: Vec<Task<()>>,
-    share: Option<ShareState>,
-    diagnostics: HashMap<
-        Arc<Path>,
-        Vec<(
-            LanguageServerId,
-            Vec<DiagnosticEntry<Unclipped<PointUtf16>>>,
-        )>,
-    >,
-    diagnostic_summaries: HashMap<Arc<Path>, HashMap<LanguageServerId, DiagnosticSummary>>,
-    client: Arc<Client>,
+    update_observer: Option<ShareState>,
     fs: Arc<dyn Fs>,
     fs_case_sensitive: bool,
     visible: bool,
-
     next_entry_id: Arc<AtomicUsize>,
 }
 
@@ -128,12 +119,9 @@ struct ScanRequest {
 pub struct RemoteWorktree {
     snapshot: Snapshot,
     background_snapshot: Arc<Mutex<Snapshot>>,
-    project_id: u64,
-    client: Arc<Client>,
     updates_tx: Option<UnboundedSender<proto::UpdateWorktree>>,
     snapshot_subscriptions: VecDeque<(usize, oneshot::Sender<()>)>,
     replica_id: ReplicaId,
-    diagnostic_summaries: HashMap<Arc<Path>, HashMap<LanguageServerId, DiagnosticSummary>>,
     visible: bool,
     disconnected: bool,
 }
@@ -346,7 +334,6 @@ enum ScanState {
 }
 
 struct ShareState {
-    project_id: u64,
     snapshots_tx:
         mpsc::UnboundedSender<(LocalSnapshot, UpdatedEntriesSet, UpdatedGitRepositoriesSet)>,
     resume_updates: watch::Sender<()>,
@@ -363,7 +350,6 @@ impl EventEmitter<Event> for Worktree {}
 
 impl Worktree {
     pub async fn local(
-        client: Arc<Client>,
         path: impl Into<Arc<Path>>,
         visible: bool,
         fs: Arc<dyn Fs>,
@@ -483,7 +469,7 @@ impl Worktree {
                 next_entry_id: Arc::clone(&next_entry_id),
                 snapshot,
                 is_scanning: watch::channel_with(true),
-                share: None,
+                update_observer: None,
                 scan_requests_tx,
                 path_prefixes_to_scan_tx,
                 _background_scanner_tasks: start_background_scan_tasks(
@@ -495,9 +481,6 @@ impl Worktree {
                     Arc::clone(&fs),
                     cx,
                 ),
-                diagnostics: Default::default(),
-                diagnostic_summaries: Default::default(),
-                client,
                 fs,
                 fs_case_sensitive,
                 visible,
@@ -506,10 +489,8 @@ impl Worktree {
     }
 
     pub fn remote(
-        project_remote_id: u64,
         replica_id: ReplicaId,
         worktree: proto::WorktreeMetadata,
-        client: Arc<Client>,
         cx: &mut AppContext,
     ) -> Model<Self> {
         cx.new_model(|cx: &mut ModelContext<Self>| {
@@ -571,14 +552,11 @@ impl Worktree {
             .detach();
 
             Worktree::Remote(RemoteWorktree {
-                project_id: project_remote_id,
                 replica_id,
                 snapshot: snapshot.clone(),
                 background_snapshot,
                 updates_tx: Some(updates_tx),
                 snapshot_subscriptions: Default::default(),
-                client: client.clone(),
-                diagnostic_summaries: Default::default(),
                 visible: worktree.visible,
                 disconnected: false,
             })
@@ -660,21 +638,6 @@ impl Worktree {
         }
     }
 
-    pub fn diagnostic_summaries(
-        &self,
-    ) -> impl Iterator<Item = (Arc<Path>, LanguageServerId, DiagnosticSummary)> + '_ {
-        match self {
-            Worktree::Local(worktree) => &worktree.diagnostic_summaries,
-            Worktree::Remote(worktree) => &worktree.diagnostic_summaries,
-        }
-        .iter()
-        .flat_map(|(path, summaries)| {
-            summaries
-                .iter()
-                .map(move |(&server_id, &summary)| (path.clone(), server_id, summary))
-        })
-    }
-
     pub fn abs_path(&self) -> Arc<Path> {
         match self {
             Worktree::Local(worktree) => worktree.abs_path.clone(),
@@ -700,32 +663,42 @@ fn start_background_scan_tasks(
     let (scan_states_tx, mut scan_states_rx) = mpsc::unbounded();
     let background_scanner = cx.background_executor().spawn({
         let abs_path = if cfg!(target_os = "windows") {
-            abs_path.canonicalize().unwrap_or_else(|_| abs_path.to_path_buf())
+            abs_path
+                .canonicalize()
+                .unwrap_or_else(|_| abs_path.to_path_buf())
         } else {
             abs_path.to_path_buf()
         };
         let background = cx.background_executor().clone();
         async move {
-            let events = fs.watch(&abs_path, FS_WATCH_LATENCY).await;
+            let (events, watcher) = fs.watch(&abs_path, FS_WATCH_LATENCY).await;
             let case_sensitive = fs.is_case_sensitive().await.unwrap_or_else(|e| {
-                log::error!(
-                    "Failed to determine whether filesystem is case sensitive (falling back to true) due to error: {e:#}"
-                );
+                log::error!("Failed to determine whether filesystem is case sensitive: {e:#}");
                 true
             });
 
-            BackgroundScanner::new(
-                snapshot,
-                next_entry_id,
+            let mut scanner = BackgroundScanner {
                 fs,
-                case_sensitive,
-                scan_states_tx,
-                background,
+                fs_case_sensitive: case_sensitive,
+                status_updates_tx: scan_states_tx,
+                executor: background,
                 scan_requests_rx,
                 path_prefixes_to_scan_rx,
-            )
-            .run(events)
-            .await;
+                next_entry_id,
+                state: Mutex::new(BackgroundScannerState {
+                    prev_snapshot: snapshot.snapshot.clone(),
+                    snapshot,
+                    scanned_dirs: Default::default(),
+                    path_prefixes_to_scan: Default::default(),
+                    paths_to_scan: Default::default(),
+                    removed_entry_ids: Default::default(),
+                    changed_paths: Default::default(),
+                }),
+                phase: BackgroundScannerPhase::InitialScan,
+                watcher,
+            };
+
+            scanner.run(events).await;
         }
     });
     let scan_state_updater = cx.spawn(|this, mut cx| async move {
@@ -778,168 +751,6 @@ impl LocalWorktree {
         path.starts_with(&self.abs_path)
     }
 
-    pub fn load_buffer(
-        &mut self,
-        path: &Path,
-        cx: &mut ModelContext<Worktree>,
-    ) -> Task<Result<Model<Buffer>>> {
-        let path = Arc::from(path);
-        let reservation = cx.reserve_model();
-        let buffer_id = BufferId::from(reservation.entity_id().as_non_zero_u64());
-        cx.spawn(move |this, mut cx| async move {
-            let (file, contents, diff_base) = this
-                .update(&mut cx, |t, cx| t.as_local().unwrap().load(&path, cx))?
-                .await?;
-            let text_buffer = cx
-                .background_executor()
-                .spawn(async move { text::Buffer::new(0, buffer_id, contents) })
-                .await;
-            cx.insert_model(reservation, |_| {
-                Buffer::build(
-                    text_buffer,
-                    diff_base,
-                    Some(Arc::new(file)),
-                    Capability::ReadWrite,
-                )
-            })
-        })
-    }
-
-    pub fn new_buffer(
-        &mut self,
-        path: Arc<Path>,
-        cx: &mut ModelContext<Worktree>,
-    ) -> Model<Buffer> {
-        let worktree = cx.handle();
-        cx.new_model(|cx| {
-            let buffer_id = BufferId::from(cx.entity_id().as_non_zero_u64());
-            let text_buffer = text::Buffer::new(0, buffer_id, "".into());
-            Buffer::build(
-                text_buffer,
-                None,
-                Some(Arc::new(File {
-                    worktree,
-                    path,
-                    mtime: None,
-                    entry_id: None,
-                    is_local: true,
-                    is_deleted: false,
-                    is_private: false,
-                })),
-                Capability::ReadWrite,
-            )
-        })
-    }
-
-    pub fn diagnostics_for_path(
-        &self,
-        path: &Path,
-    ) -> Vec<(
-        LanguageServerId,
-        Vec<DiagnosticEntry<Unclipped<PointUtf16>>>,
-    )> {
-        self.diagnostics.get(path).cloned().unwrap_or_default()
-    }
-
-    pub fn clear_diagnostics_for_language_server(
-        &mut self,
-        server_id: LanguageServerId,
-        _: &mut ModelContext<Worktree>,
-    ) {
-        let worktree_id = self.id().to_proto();
-        self.diagnostic_summaries
-            .retain(|path, summaries_by_server_id| {
-                if summaries_by_server_id.remove(&server_id).is_some() {
-                    if let Some(share) = self.share.as_ref() {
-                        self.client
-                            .send(proto::UpdateDiagnosticSummary {
-                                project_id: share.project_id,
-                                worktree_id,
-                                summary: Some(proto::DiagnosticSummary {
-                                    path: path.to_string_lossy().to_string(),
-                                    language_server_id: server_id.0 as u64,
-                                    error_count: 0,
-                                    warning_count: 0,
-                                }),
-                            })
-                            .log_err();
-                    }
-                    !summaries_by_server_id.is_empty()
-                } else {
-                    true
-                }
-            });
-
-        self.diagnostics.retain(|_, diagnostics_by_server_id| {
-            if let Ok(ix) = diagnostics_by_server_id.binary_search_by_key(&server_id, |e| e.0) {
-                diagnostics_by_server_id.remove(ix);
-                !diagnostics_by_server_id.is_empty()
-            } else {
-                true
-            }
-        });
-    }
-
-    pub fn update_diagnostics(
-        &mut self,
-        server_id: LanguageServerId,
-        worktree_path: Arc<Path>,
-        diagnostics: Vec<DiagnosticEntry<Unclipped<PointUtf16>>>,
-        _: &mut ModelContext<Worktree>,
-    ) -> Result<bool> {
-        let summaries_by_server_id = self
-            .diagnostic_summaries
-            .entry(worktree_path.clone())
-            .or_default();
-
-        let old_summary = summaries_by_server_id
-            .remove(&server_id)
-            .unwrap_or_default();
-
-        let new_summary = DiagnosticSummary::new(&diagnostics);
-        if new_summary.is_empty() {
-            if let Some(diagnostics_by_server_id) = self.diagnostics.get_mut(&worktree_path) {
-                if let Ok(ix) = diagnostics_by_server_id.binary_search_by_key(&server_id, |e| e.0) {
-                    diagnostics_by_server_id.remove(ix);
-                }
-                if diagnostics_by_server_id.is_empty() {
-                    self.diagnostics.remove(&worktree_path);
-                }
-            }
-        } else {
-            summaries_by_server_id.insert(server_id, new_summary);
-            let diagnostics_by_server_id =
-                self.diagnostics.entry(worktree_path.clone()).or_default();
-            match diagnostics_by_server_id.binary_search_by_key(&server_id, |e| e.0) {
-                Ok(ix) => {
-                    diagnostics_by_server_id[ix] = (server_id, diagnostics);
-                }
-                Err(ix) => {
-                    diagnostics_by_server_id.insert(ix, (server_id, diagnostics));
-                }
-            }
-        }
-
-        if !old_summary.is_empty() || !new_summary.is_empty() {
-            if let Some(share) = self.share.as_ref() {
-                self.client
-                    .send(proto::UpdateDiagnosticSummary {
-                        project_id: share.project_id,
-                        worktree_id: self.id().to_proto(),
-                        summary: Some(proto::DiagnosticSummary {
-                            path: worktree_path.to_string_lossy().to_string(),
-                            language_server_id: server_id.0 as u64,
-                            error_count: new_summary.error_count as u32,
-                            warning_count: new_summary.warning_count as u32,
-                        }),
-                    })
-                    .log_err();
-            }
-        }
-
-        Ok(!old_summary.is_empty() || !new_summary.is_empty())
-    }
-
     fn restart_background_scanners(&mut self, cx: &mut ModelContext<Worktree>) {
         let (scan_requests_tx, scan_requests_rx) = channel::unbounded();
         let (path_prefixes_to_scan_tx, path_prefixes_to_scan_rx) = channel::unbounded();
@@ -968,7 +779,7 @@ impl LocalWorktree {
         new_snapshot.share_private_files = self.snapshot.share_private_files;
         self.snapshot = new_snapshot;
 
-        if let Some(share) = self.share.as_mut() {
+        if let Some(share) = self.update_observer.as_mut() {
             share
                 .snapshots_tx
                 .unbounded_send((
@@ -1109,7 +920,7 @@ impl LocalWorktree {
         }
     }
 
-    fn load(
+    pub fn load_file(
         &self,
         path: &Path,
         cx: &mut ModelContext<Worktree>,
@@ -1203,97 +1014,6 @@ impl LocalWorktree {
         })
     }
 
-    pub fn save_buffer(
-        &self,
-        buffer_handle: Model<Buffer>,
-        path: Arc<Path>,
-        mut has_changed_file: bool,
-        cx: &mut ModelContext<Worktree>,
-    ) -> Task<Result<()>> {
-        let buffer = buffer_handle.read(cx);
-
-        let rpc = self.client.clone();
-        let buffer_id: u64 = buffer.remote_id().into();
-        let project_id = self.share.as_ref().map(|share| share.project_id);
-
-        if buffer.file().is_some_and(|file| !file.is_created()) {
-            has_changed_file = true;
-        }
-
-        let text = buffer.as_rope().clone();
-        let version = buffer.version();
-        let save = self.write_file(path.as_ref(), text, buffer.line_ending(), cx);
-        let fs = Arc::clone(&self.fs);
-        let abs_path = self.absolutize(&path);
-        let is_private = self.snapshot.is_path_private(&path);
-
-        cx.spawn(move |this, mut cx| async move {
-            let entry = save.await?;
-            let abs_path = abs_path?;
-            let this = this.upgrade().context("worktree dropped")?;
-
-            let (entry_id, mtime, path, is_dotenv) = match entry {
-                Some(entry) => (Some(entry.id), entry.mtime, entry.path, entry.is_private),
-                None => {
-                    let metadata = fs
-                        .metadata(&abs_path)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Fetching metadata after saving the excluded buffer {abs_path:?}"
-                            )
-                        })?
-                        .with_context(|| {
-                            format!("Excluded buffer {path:?} got removed during saving")
-                        })?;
-                    (None, Some(metadata.mtime), path, is_private)
-                }
-            };
-
-            if has_changed_file {
-                let new_file = Arc::new(File {
-                    entry_id,
-                    worktree: this,
-                    path,
-                    mtime,
-                    is_local: true,
-                    is_deleted: false,
-                    is_private: is_dotenv,
-                });
-
-                if let Some(project_id) = project_id {
-                    rpc.send(proto::UpdateBufferFile {
-                        project_id,
-                        buffer_id,
-                        file: Some(new_file.to_proto()),
-                    })
-                    .log_err();
-                }
-
-                buffer_handle.update(&mut cx, |buffer, cx| {
-                    if has_changed_file {
-                        buffer.file_updated(new_file, cx);
-                    }
-                })?;
-            }
-
-            if let Some(project_id) = project_id {
-                rpc.send(proto::BufferSaved {
-                    project_id,
-                    buffer_id,
-                    version: serialize_version(&version),
-                    mtime: mtime.map(|time| time.into()),
-                })?;
-            }
-
-            buffer_handle.update(&mut cx, |buffer, cx| {
-                buffer.did_save(version.clone(), mtime, cx);
-            })?;
-
-            Ok(())
-        })
-    }
-
     /// Find the lowest path in the worktree's datastructures that is an ancestor
     fn lowest_ancestor(&self, path: &Path) -> PathBuf {
         let mut lowest_ancestor = None;
@@ -1312,22 +1032,34 @@ impl LocalWorktree {
         path: impl Into<Arc<Path>>,
         is_dir: bool,
         cx: &mut ModelContext<Worktree>,
-    ) -> Task<Result<Option<Entry>>> {
+    ) -> Task<Result<CreatedEntry>> {
         let path = path.into();
-        let lowest_ancestor = self.lowest_ancestor(&path);
-        let abs_path = self.absolutize(&path);
+        let abs_path = match self.absolutize(&path) {
+            Ok(path) => path,
+            Err(e) => return Task::ready(Err(e.context(format!("absolutizing path {path:?}")))),
+        };
+        let path_excluded = self.is_path_excluded(&abs_path);
         let fs = self.fs.clone();
+        let task_abs_path = abs_path.clone();
         let write = cx.background_executor().spawn(async move {
             if is_dir {
-                fs.create_dir(&abs_path?).await
-            } else {
-                fs.save(&abs_path?, &Default::default(), Default::default())
+                fs.create_dir(&task_abs_path)
                     .await
+                    .with_context(|| format!("creating directory {task_abs_path:?}"))
+            } else {
+                fs.save(&task_abs_path, &Rope::default(), LineEnding::default())
+                    .await
+                    .with_context(|| format!("creating file {task_abs_path:?}"))
             }
         });
 
+        let lowest_ancestor = self.lowest_ancestor(&path);
         cx.spawn(|this, mut cx| async move {
             write.await?;
+            if path_excluded {
+                return Ok(CreatedEntry::Excluded { abs_path });
+            }
+
             let (result, refreshes) = this.update(&mut cx, |this, cx| {
                 let mut refreshes = Vec::new();
                 let refresh_paths = path.strip_prefix(&lowest_ancestor).unwrap();
@@ -1352,11 +1084,14 @@ impl LocalWorktree {
                 refresh.await.log_err();
             }
 
-            result.await
+            Ok(result
+                .await?
+                .map(CreatedEntry::Included)
+                .unwrap_or_else(|| CreatedEntry::Excluded { abs_path }))
         })
     }
 
-    pub(crate) fn write_file(
+    pub fn write_file(
         &self,
         path: impl Into<Arc<Path>>,
         text: Rope,
@@ -1438,19 +1173,22 @@ impl LocalWorktree {
         entry_id: ProjectEntryId,
         new_path: impl Into<Arc<Path>>,
         cx: &mut ModelContext<Worktree>,
-    ) -> Task<Result<Option<Entry>>> {
+    ) -> Task<Result<CreatedEntry>> {
         let old_path = match self.entry_for_id(entry_id) {
             Some(entry) => entry.path.clone(),
-            None => return Task::ready(Ok(None)),
+            None => return Task::ready(Err(anyhow!("no entry to rename for id {entry_id:?}"))),
         };
         let new_path = new_path.into();
         let abs_old_path = self.absolutize(&old_path);
-        let abs_new_path = self.absolutize(&new_path);
+        let Ok(abs_new_path) = self.absolutize(&new_path) else {
+            return Task::ready(Err(anyhow!("absolutizing path {new_path:?}")));
+        };
+        let abs_path = abs_new_path.clone();
         let fs = self.fs.clone();
         let case_sensitive = self.fs_case_sensitive;
         let rename = cx.background_executor().spawn(async move {
             let abs_old_path = abs_old_path?;
-            let abs_new_path = abs_new_path?;
+            let abs_new_path = abs_new_path;
 
             let abs_old_path_lower = abs_old_path.to_str().map(|p| p.to_lowercase());
             let abs_new_path_lower = abs_new_path.to_str().map(|p| p.to_lowercase());
@@ -1470,16 +1208,20 @@ impl LocalWorktree {
                 },
             )
             .await
+            .with_context(|| format!("Renaming {abs_old_path:?} into {abs_new_path:?}"))
         });
 
         cx.spawn(|this, mut cx| async move {
             rename.await?;
-            this.update(&mut cx, |this, cx| {
-                this.as_local_mut()
-                    .unwrap()
-                    .refresh_entry(new_path.clone(), Some(old_path), cx)
-            })?
-            .await
+            Ok(this
+                .update(&mut cx, |this, cx| {
+                    this.as_local_mut()
+                        .unwrap()
+                        .refresh_entry(new_path.clone(), Some(old_path), cx)
+                })?
+                .await?
+                .map(CreatedEntry::Included)
+                .unwrap_or_else(|| CreatedEntry::Excluded { abs_path }))
         })
     }
 
@@ -1579,8 +1321,7 @@ impl LocalWorktree {
         project_id: u64,
         cx: &mut ModelContext<Worktree>,
         callback: F,
-    ) -> oneshot::Receiver<()>
-    where
+    ) where
         F: 'static + Send + Fn(proto::UpdateWorktree) -> Fut,
         Fut: Send + Future<Output = bool>,
     {
@@ -1589,12 +1330,9 @@ impl LocalWorktree {
         #[cfg(not(any(test, feature = "test-support")))]
         const MAX_CHUNK_SIZE: usize = 256;
 
-        let (share_tx, share_rx) = oneshot::channel();
-
-        if let Some(share) = self.share.as_mut() {
-            share_tx.send(()).ok();
-            *share.resume_updates.borrow_mut() = ();
-            return share_rx;
+        if let Some(observer) = self.update_observer.as_mut() {
+            *observer.resume_updates.borrow_mut() = ();
+            return;
         }
 
         let (resume_updates_tx, mut resume_updates_rx) = watch::channel::<()>();
@@ -1632,47 +1370,23 @@ impl LocalWorktree {
                     }
                 }
             }
-            share_tx.send(()).ok();
             Some(())
         });
 
-        self.share = Some(ShareState {
-            project_id,
+        self.update_observer = Some(ShareState {
             snapshots_tx,
             resume_updates: resume_updates_tx,
             _maintain_remote_snapshot,
         });
-        share_rx
     }
 
-    pub fn share(&mut self, project_id: u64, cx: &mut ModelContext<Worktree>) -> Task<Result<()>> {
-        let client = self.client.clone();
-
-        for (path, summaries) in &self.diagnostic_summaries {
-            for (&server_id, summary) in summaries {
-                if let Err(e) = self.client.send(proto::UpdateDiagnosticSummary {
-                    project_id,
-                    worktree_id: cx.entity_id().as_u64(),
-                    summary: Some(summary.to_proto(server_id, path)),
-                }) {
-                    return Task::ready(Err(e));
-                }
-            }
-        }
-
-        let rx = self.observe_updates(project_id, cx, move |update| {
-            client.request(update).map(|result| result.is_ok())
-        });
-        cx.background_executor()
-            .spawn(async move { rx.await.map_err(|_| anyhow!("share ended")) })
+    pub fn stop_observing_updates(&mut self) {
+        self.update_observer.take();
     }
 
-    pub fn unshare(&mut self) {
-        self.share.take();
-    }
-
-    pub fn is_shared(&self) -> bool {
-        self.share.is_some()
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_update_observer(&self) -> bool {
+        self.update_observer.is_some()
     }
 
     pub fn share_private_files(&mut self, cx: &mut ModelContext<Worktree>) {
@@ -1690,37 +1404,6 @@ impl RemoteWorktree {
         self.updates_tx.take();
         self.snapshot_subscriptions.clear();
         self.disconnected = true;
-    }
-
-    pub fn save_buffer(
-        &self,
-        buffer_handle: Model<Buffer>,
-        new_path: Option<proto::ProjectPath>,
-        cx: &mut ModelContext<Worktree>,
-    ) -> Task<Result<()>> {
-        let buffer = buffer_handle.read(cx);
-        let buffer_id = buffer.remote_id().into();
-        let version = buffer.version();
-        let rpc = self.client.clone();
-        let project_id = self.project_id;
-        cx.spawn(move |_, mut cx| async move {
-            let response = rpc
-                .request(proto::SaveBuffer {
-                    project_id,
-                    buffer_id,
-                    new_path,
-                    version: serialize_version(&version),
-                })
-                .await?;
-            let version = deserialize_version(&response.version);
-            let mtime = response.mtime.map(|mtime| mtime.into());
-
-            buffer_handle.update(&mut cx, |buffer, cx| {
-                buffer.did_save(version.clone(), mtime, cx);
-            })?;
-
-            Ok(())
-        })
     }
 
     pub fn update_from_remote(&mut self, update: proto::UpdateWorktree) {
@@ -1753,32 +1436,6 @@ impl RemoteWorktree {
         async move {
             rx.await?;
             Ok(())
-        }
-    }
-
-    pub fn update_diagnostic_summary(
-        &mut self,
-        path: Arc<Path>,
-        summary: &proto::DiagnosticSummary,
-    ) {
-        let server_id = LanguageServerId(summary.language_server_id as usize);
-        let summary = DiagnosticSummary {
-            error_count: summary.error_count as usize,
-            warning_count: summary.warning_count as usize,
-        };
-
-        if summary.is_empty() {
-            if let Some(summaries) = self.diagnostic_summaries.get_mut(&path) {
-                summaries.remove(&server_id);
-                if summaries.is_empty() {
-                    self.diagnostic_summaries.remove(&path);
-                }
-            }
-        } else {
-            self.diagnostic_summaries
-                .entry(path)
-                .or_default()
-                .insert(server_id, summary);
         }
     }
 
@@ -2972,29 +2629,6 @@ impl language::LocalFile for File {
         cx.background_executor()
             .spawn(async move { fs.load(&abs_path?).await })
     }
-
-    fn buffer_reloaded(
-        &self,
-        buffer_id: BufferId,
-        version: &clock::Global,
-        line_ending: LineEnding,
-        mtime: Option<SystemTime>,
-        cx: &mut AppContext,
-    ) {
-        let worktree = self.worktree.read(cx).as_local().unwrap();
-        if let Some(project_id) = worktree.share.as_ref().map(|share| share.project_id) {
-            worktree
-                .client
-                .send(proto::BufferReloaded {
-                    project_id,
-                    buffer_id: buffer_id.into(),
-                    version: serialize_version(version),
-                    mtime: mtime.map(|time| time.into()),
-                    line_ending: serialize_line_ending(line_ending) as i32,
-                })
-                .log_err();
-        }
-    }
 }
 
 impl File {
@@ -3327,6 +2961,7 @@ struct BackgroundScanner {
     path_prefixes_to_scan_rx: channel::Receiver<Arc<Path>>,
     next_entry_id: Arc<AtomicUsize>,
     phase: BackgroundScannerPhase,
+    watcher: Arc<dyn Watcher>,
 }
 
 #[derive(PartialEq)]
@@ -3337,38 +2972,6 @@ enum BackgroundScannerPhase {
 }
 
 impl BackgroundScanner {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        snapshot: LocalSnapshot,
-        next_entry_id: Arc<AtomicUsize>,
-        fs: Arc<dyn Fs>,
-        fs_case_sensitive: bool,
-        status_updates_tx: UnboundedSender<ScanState>,
-        executor: BackgroundExecutor,
-        scan_requests_rx: channel::Receiver<ScanRequest>,
-        path_prefixes_to_scan_rx: channel::Receiver<Arc<Path>>,
-    ) -> Self {
-        Self {
-            fs,
-            fs_case_sensitive,
-            status_updates_tx,
-            executor,
-            scan_requests_rx,
-            path_prefixes_to_scan_rx,
-            next_entry_id,
-            state: Mutex::new(BackgroundScannerState {
-                prev_snapshot: snapshot.snapshot.clone(),
-                snapshot,
-                scanned_dirs: Default::default(),
-                path_prefixes_to_scan: Default::default(),
-                paths_to_scan: Default::default(),
-                removed_entry_ids: Default::default(),
-                changed_paths: Default::default(),
-            }),
-            phase: BackgroundScannerPhase::InitialScan,
-        }
-    }
-
     async fn run(&mut self, mut fs_events_rx: Pin<Box<dyn Send + Stream<Item = Vec<PathBuf>>>>) {
         use futures::FutureExt as _;
 
@@ -3396,7 +2999,7 @@ impl BackgroundScanner {
                     if let Some(ancestor_dot_git) =
                         self.fs.canonicalize(&ancestor_dot_git).await.log_err()
                     {
-                        let ancestor_git_events =
+                        let (ancestor_git_events, _) =
                             self.fs.watch(&ancestor_dot_git, FS_WATCH_LATENCY).await;
                         fs_events_rx = select(fs_events_rx, ancestor_git_events).boxed();
 
@@ -3987,6 +3590,7 @@ impl BackgroundScanner {
         }
 
         state.populate_dir(&job.path, new_entries, new_ignore);
+        self.watcher.add(job.abs_path.as_ref()).log_err();
 
         for new_job in new_jobs.into_iter().flatten() {
             job.scan_queue
@@ -5088,46 +4692,12 @@ impl ProjectEntryId {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Serialize)]
-pub struct DiagnosticSummary {
-    pub error_count: usize,
-    pub warning_count: usize,
-}
-
-impl DiagnosticSummary {
-    fn new<'a, T: 'a>(diagnostics: impl IntoIterator<Item = &'a DiagnosticEntry<T>>) -> Self {
-        let mut this = Self {
-            error_count: 0,
-            warning_count: 0,
-        };
-
-        for entry in diagnostics {
-            if entry.diagnostic.is_primary {
-                match entry.diagnostic.severity {
-                    DiagnosticSeverity::ERROR => this.error_count += 1,
-                    DiagnosticSeverity::WARNING => this.warning_count += 1,
-                    _ => {}
-                }
-            }
-        }
-
-        this
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.error_count == 0 && self.warning_count == 0
-    }
-
-    pub fn to_proto(
-        &self,
-        language_server_id: LanguageServerId,
-        path: &Path,
-    ) -> proto::DiagnosticSummary {
-        proto::DiagnosticSummary {
-            path: path.to_string_lossy().to_string(),
-            language_server_id: language_server_id.0 as u64,
-            error_count: self.error_count as u32,
-            warning_count: self.warning_count as u32,
+#[cfg(any(test, feature = "test-support"))]
+impl CreatedEntry {
+    pub fn to_included(self) -> Option<Entry> {
+        match self {
+            CreatedEntry::Included(entry) => Some(entry),
+            CreatedEntry::Excluded { .. } => None,
         }
     }
 }
