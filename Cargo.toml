@@ -839,7 +839,7 @@ zed_actions = { codegen-units = 1 }
 
 [profile.release]
 strip = true
-debug = "limited"
+debug = "none"
 lto = "thin"
 codegen-units = 1
 
