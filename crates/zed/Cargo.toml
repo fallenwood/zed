@@ -176,6 +176,9 @@ winresource = "0.1"
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 ashpd.workspace = true
 
+[features]
+default = ["mimalloc"]
+
 [dev-dependencies]
 call = { workspace = true, features = ["test-support"] }
 dap = { workspace = true, features = ["test-support"] }
