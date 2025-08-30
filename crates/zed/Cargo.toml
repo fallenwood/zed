@@ -177,7 +177,7 @@ winresource = "0.1"
 ashpd.workspace = true
 
 [features]
-default = ["mimalloc"]
+# default = ["mimalloc"]
 
 [dev-dependencies]
 call = { workspace = true, features = ["test-support"] }
