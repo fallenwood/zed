@@ -43,7 +43,7 @@ use util::{ResultExt, TryFutureExt, paths::PathExt};
 use workspace::{
     CollaboratorId, ItemId, ItemNavHistory, ToolbarItemLocation, ViewId, Workspace, WorkspaceId,
     invalid_buffer_view::InvalidBufferView,
-    item::{FollowableItem, Item, ItemEvent, ProjectItem, SaveOptions},
+    item::{FollowableItem, Item, ItemBufferKind, ItemEvent, ProjectItem, SaveOptions},
     searchable::{
         Direction, FilteredSearchRange, SearchEvent, SearchableItem, SearchableItemHandle,
     },
@@ -747,8 +747,11 @@ impl Item for Editor {
             .for_each_buffer(|buffer| f(buffer.entity_id(), buffer.read(cx)));
     }
 
-    fn is_singleton(&self, cx: &App) -> bool {
-        self.buffer.read(cx).is_singleton()
+    fn buffer_kind(&self, cx: &App) -> ItemBufferKind {
+        match self.buffer.read(cx).is_singleton() {
+            true => ItemBufferKind::Singleton,
+            false => ItemBufferKind::Multibuffer,
+        }
     }
 
     fn can_save_as(&self, cx: &App) -> bool {
@@ -832,12 +835,11 @@ impl Item for Editor {
 
         // let mut buffers_to_save =
         let buffers_to_save = if self.buffer.read(cx).is_singleton() && !options.autosave {
-            buffers.clone()
+            buffers
         } else {
             buffers
-                .iter()
+                .into_iter()
                 .filter(|buffer| buffer.read(cx).is_dirty())
-                .cloned()
                 .collect()
         };
 
@@ -861,22 +863,6 @@ impl Item for Editor {
                         project.save_buffers(buffers_to_save.clone(), cx)
                     })?
                     .await?;
-            }
-
-            // Notify about clean buffers for language server events
-            let buffers_that_were_not_saved: Vec<_> = buffers
-                .into_iter()
-                .filter(|b| !buffers_to_save.contains(b))
-                .collect();
-
-            for buffer in buffers_that_were_not_saved {
-                buffer
-                    .update(cx, |buffer, cx| {
-                        let version = buffer.saved_version().clone();
-                        let mtime = buffer.saved_mtime();
-                        buffer.did_save(version, mtime, cx);
-                    })
-                    .ok();
             }
 
             Ok(())
@@ -1553,7 +1539,8 @@ impl SearchableItem for Editor {
 
     fn query_suggestion(&mut self, window: &mut Window, cx: &mut Context<Self>) -> String {
         let setting = EditorSettings::get_global(cx).seed_search_query_from_cursor;
-        let snapshot = &self.snapshot(window, cx).buffer_snapshot;
+        let snapshot = self.snapshot(window, cx);
+        let snapshot = snapshot.buffer_snapshot();
         let selection = self.selections.newest_adjusted(cx);
 
         match setting {
